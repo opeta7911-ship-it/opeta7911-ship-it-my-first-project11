@@ -80,7 +80,7 @@ class PlayerokClient:
         async with self._lock:
             account = await self._ensure_account()
             await asyncio.to_thread(
-                account.publish_item, playerok_id, priority_status_id
+                account.increase_item_priority_status, playerok_id, priority_status_id
             )
 
     async def is_item_active(self, playerok_id: str) -> bool:
