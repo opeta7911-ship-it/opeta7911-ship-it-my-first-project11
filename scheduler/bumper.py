@@ -127,10 +127,15 @@ class BumpEngine:
         if start > now:
             start -= timedelta(days=1)
         elapsed_min = int((now - start).total_seconds() // 60)
-        position_in_cycle = elapsed_min % cycle.duration_minutes
-        if position_in_cycle >= total_slots:
-            return None
-        return position_in_cycle
+        pos_in_cycle = elapsed_min % cycle.duration_minutes
+
+        # Равномерно распределяем лоты по длительности цикла.
+        # Пример: 2 лота / 60 мин → поднятия на минутах 0 и 30.
+        interval = cycle.duration_minutes / total_slots
+        for i in range(total_slots):
+            if pos_in_cycle == round(i * interval):
+                return i
+        return None
 
     def _pick_from_independent(self, flt: Filter, now: datetime) -> Lot | None:
         if not flt.interval_minutes:
