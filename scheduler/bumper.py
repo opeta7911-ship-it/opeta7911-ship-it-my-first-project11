@@ -1,0 +1,207 @@
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
+
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from database.db import Database
+from database.models import BumpHistory, Cycle, Filter, Lot
+from playerok.client import PlayerokClient
+
+logger = logging.getLogger(__name__)
+
+BumpCallback = Callable[[Lot, bool, int, str | None], Awaitable[None]]
+
+
+class BumpEngine:
+    """Движок поднятий: тикает раз в минуту, выбирает следующий лот и поднимает."""
+
+    def __init__(
+        self,
+        db: Database,
+        playerok: PlayerokClient,
+        on_result: BumpCallback,
+    ) -> None:
+        self.db = db
+        self.playerok = playerok
+        self.on_result = on_result
+        self._task: asyncio.Task | None = None
+        self._enabled = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    async def start(self) -> None:
+        if self._task and not self._task.done():
+            return
+        self._enabled = True
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self._enabled = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _run_loop(self) -> None:
+        await self._sleep_to_next_minute()
+        while self._enabled:
+            try:
+                await self._tick()
+            except Exception:
+                logger.exception("BumpEngine tick failed")
+            await self._sleep_to_next_minute()
+
+    async def _sleep_to_next_minute(self) -> None:
+        now = datetime.now()
+        next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+        await asyncio.sleep(max(0.0, (next_minute - now).total_seconds()))
+
+    async def _tick(self) -> None:
+        now = datetime.now()
+        lot = await self._pick_next_lot(now)
+        if lot is None:
+            return
+        await self._bump_lot(lot)
+
+    async def _pick_next_lot(self, now: datetime) -> Lot | None:
+        async with self.db.session_factory() as session:
+            cycles_q = await session.execute(
+                select(Cycle)
+                .where(Cycle.enabled.is_(True))
+                .options(selectinload(Cycle.filters).selectinload(Filter.lots))
+            )
+            cycles = cycles_q.scalars().all()
+
+            for cycle in cycles:
+                lot = self._pick_from_cycle(cycle, now)
+                if lot is not None:
+                    return lot
+
+            indep_q = await session.execute(
+                select(Filter)
+                .where(Filter.cycle_id.is_(None), Filter.enabled.is_(True))
+                .options(selectinload(Filter.lots))
+            )
+            for flt in indep_q.scalars():
+                lot = self._pick_from_independent(flt, now)
+                if lot is not None:
+                    return lot
+        return None
+
+    def _pick_from_cycle(self, cycle: Cycle, now: datetime) -> Lot | None:
+        active_filters = sorted(
+            [f for f in cycle.filters if f.enabled],
+            key=lambda f: f.order_index,
+        )
+        flat_lots: list[Lot] = []
+        for flt in active_filters:
+            if not self._filter_has_budget(flt):
+                continue
+            for lot in flt.lots:
+                if not lot.paused:
+                    flat_lots.append(lot)
+        if not flat_lots:
+            return None
+
+        slot = self._current_slot(cycle, now, len(flat_lots))
+        if slot is None:
+            return None
+        return flat_lots[slot]
+
+    def _current_slot(
+        self, cycle: Cycle, now: datetime, total_slots: int
+    ) -> int | None:
+        try:
+            sh, sm = (int(p) for p in cycle.start_time.split(":"))
+        except ValueError:
+            return None
+        start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        if start > now:
+            start -= timedelta(days=1)
+        elapsed_min = int((now - start).total_seconds() // 60)
+        position_in_cycle = elapsed_min % cycle.duration_minutes
+        if position_in_cycle >= total_slots:
+            return None
+        return position_in_cycle
+
+    def _pick_from_independent(self, flt: Filter, now: datetime) -> Lot | None:
+        if not flt.interval_minutes:
+            return None
+        if not self._filter_has_budget(flt):
+            return None
+
+        if flt.start_time:
+            try:
+                sh, sm = (int(p) for p in flt.start_time.split(":"))
+                start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+                if start > now:
+                    start -= timedelta(days=1)
+                elapsed = int((now - start).total_seconds() // 60)
+                if elapsed % flt.interval_minutes != 0:
+                    return None
+            except ValueError:
+                return None
+        else:
+            if now.minute % flt.interval_minutes != 0:
+                return None
+
+        candidates = [lot for lot in flt.lots if not lot.paused]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda l: (l.last_bumped_at or datetime.min, l.id)
+        )
+        return candidates[0]
+
+    @staticmethod
+    def _filter_has_budget(flt: Filter) -> bool:
+        if flt.spend_limit_kopecks is None:
+            return True
+        return flt.spent_kopecks < flt.spend_limit_kopecks
+
+    async def _bump_lot(self, lot: Lot) -> None:
+        try:
+            cost, status_id = await self.playerok.refresh_bump_cost(
+                lot.playerok_id, lot.price_kopecks / 100
+            )
+        except Exception as exc:
+            await self._record_failure(lot.id, f"Не удалось получить цену поднятия: {exc}")
+            return
+
+        try:
+            await self.playerok.bump(lot.playerok_id, status_id)
+        except Exception as exc:
+            await self._record_failure(lot.id, str(exc))
+            return
+
+        await self._record_success(lot.id, cost)
+
+    async def _record_success(self, lot_id: int, cost_kopecks: int) -> None:
+        async with self.db.session_factory() as session:
+            lot = await session.get(Lot, lot_id, options=[selectinload(Lot.filter)])
+            if lot is None:
+                return
+            lot.last_bumped_at = datetime.utcnow()
+            lot.bump_cost_kopecks = cost_kopecks
+            lot.filter.spent_kopecks += cost_kopecks
+            session.add(BumpHistory(lot_id=lot.id, success=True, cost_kopecks=cost_kopecks))
+            await session.commit()
+            await session.refresh(lot, ["filter"])
+            await self.on_result(lot, True, cost_kopecks, None)
+
+    async def _record_failure(self, lot_id: int, error: str) -> None:
+        async with self.db.session_factory() as session:
+            lot = await session.get(Lot, lot_id, options=[selectinload(Lot.filter)])
+            if lot is None:
+                return
+            session.add(BumpHistory(lot_id=lot.id, success=False, error=error))
+            await session.commit()
+            await self.on_result(lot, False, 0, error)

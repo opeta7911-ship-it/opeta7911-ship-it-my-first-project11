@@ -1,0 +1,16 @@
+[Unit]
+Description=Playerok Auto-Bump Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/playerok-bot
+ExecStart=/opt/playerok-bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/opt/playerok-bot/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
