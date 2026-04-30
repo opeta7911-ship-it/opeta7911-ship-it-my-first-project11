@@ -66,24 +66,22 @@ class BumpEngine:
 
     async def _tick(self) -> None:
         now = datetime.now()
-        lot = await self._pick_next_lot(now)
-        if lot is None:
-            return
-        await self._bump_lot(lot)
+        lots = await self._pick_next_lots(now)
+        for lot in lots:
+            await self._bump_lot(lot)
 
-    async def _pick_next_lot(self, now: datetime) -> Lot | None:
+    async def _pick_next_lots(self, now: datetime) -> list[Lot]:
+        result: list[Lot] = []
         async with self.db.session_factory() as session:
             cycles_q = await session.execute(
                 select(Cycle)
                 .where(Cycle.enabled.is_(True))
                 .options(selectinload(Cycle.filters).selectinload(Filter.lots))
             )
-            cycles = cycles_q.scalars().all()
-
-            for cycle in cycles:
+            for cycle in cycles_q.scalars().all():
                 lot = self._pick_from_cycle(cycle, now)
                 if lot is not None:
-                    return lot
+                    result.append(lot)
 
             indep_q = await session.execute(
                 select(Filter)
@@ -91,10 +89,8 @@ class BumpEngine:
                 .options(selectinload(Filter.lots))
             )
             for flt in indep_q.scalars():
-                lot = self._pick_from_independent(flt, now)
-                if lot is not None:
-                    return lot
-        return None
+                result.extend(self._pick_from_independent(flt, now))
+        return result
 
     def _pick_from_cycle(self, cycle: Cycle, now: datetime) -> Lot | None:
         active_filters = sorted(
@@ -137,34 +133,20 @@ class BumpEngine:
                 return i
         return None
 
-    def _pick_from_independent(self, flt: Filter, now: datetime) -> Lot | None:
+    def _pick_from_independent(self, flt: Filter, now: datetime) -> list[Lot]:
         if not flt.interval_minutes:
-            return None
+            return []
         if not self._filter_has_budget(flt):
-            return None
+            return []
+        if now.minute % flt.interval_minutes != 0:
+            return []
 
-        if flt.start_time:
-            try:
-                sh, sm = (int(p) for p in flt.start_time.split(":"))
-                start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-                if start > now:
-                    start -= timedelta(days=1)
-                elapsed = int((now - start).total_seconds() // 60)
-                if elapsed % flt.interval_minutes != 0:
-                    return None
-            except ValueError:
-                return None
-        else:
-            if now.minute % flt.interval_minutes != 0:
-                return None
-
-        candidates = [lot for lot in flt.lots if not lot.paused]
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda l: (l.last_bumped_at or datetime.min, l.id)
+        candidates = sorted(
+            [lot for lot in flt.lots if not lot.paused],
+            key=lambda l: (l.last_bumped_at or datetime.min, l.id),
         )
-        return candidates[0]
+        n = getattr(flt, "lots_per_trigger", 1) or 1
+        return candidates[:n]
 
     @staticmethod
     def _filter_has_budget(flt: Filter) -> bool:

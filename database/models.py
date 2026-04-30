@@ -29,9 +29,9 @@ class Filter(Base):
     cycle_id: Mapped[int | None] = mapped_column(ForeignKey("cycles.id"), nullable=True)
 
     interval_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    start_time: Mapped[str | None] = mapped_column(String(5), nullable=True)
     spend_limit_kopecks: Mapped[int | None] = mapped_column(Integer, nullable=True)
     spent_kopecks: Mapped[int] = mapped_column(Integer, default=0)
+    lots_per_trigger: Mapped[int] = mapped_column(Integer, default=1)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

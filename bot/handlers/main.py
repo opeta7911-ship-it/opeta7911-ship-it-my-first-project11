@@ -11,8 +11,7 @@ def _greeting(running: bool) -> str:
     status = "🟢 ВКЛ" if running else "🔴 ВЫКЛ"
     return (
         "<b>Playerok Auto-Bump</b>\n\n"
-        f"Автоподнятие: {status}\n\n"
-        "Управление: фильтры → циклы → запуск."
+        f"Автоподнятие: {status}"
     )
 
 

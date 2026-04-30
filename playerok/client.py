@@ -3,9 +3,11 @@ import re
 from dataclasses import dataclass
 
 from playerokapi.account import Account
+from playerokapi.enums import ItemStatuses
 
 
 PLAYEROK_URL_RE = re.compile(r"playerok\.com/products/([^/?#\s]+)", re.IGNORECASE)
+BASE_URL = "https://playerok.com/products/"
 
 
 def extract_slug(url: str) -> str | None:
@@ -14,13 +16,17 @@ def extract_slug(url: str) -> str | None:
 
 
 @dataclass
-class LotInfo:
+class MyLot:
     playerok_id: str
     slug: str
     name: str
     price_kopecks: int
     bump_cost_kopecks: int
     bump_priority_status_id: str
+
+    @property
+    def url(self) -> str:
+        return f"{BASE_URL}{self.slug}"
 
 
 class PlayerokClient:
@@ -45,26 +51,49 @@ class PlayerokClient:
         self._user_agent = user_agent
         self._account = None
 
-    async def get_lot_by_url(self, url: str) -> LotInfo:
-        slug = extract_slug(url)
-        if not slug:
-            raise ValueError("Невалидная ссылка Playerok")
+    def _fetch_all_my_lots_sync(self, account: Account) -> list:
+        """Загружает все активные лоты аккаунта с пагинацией."""
+        user = account.get_user(id=account.id)
+        all_items = []
+        cursor = None
+        while True:
+            page = user.get_items(
+                count=24,
+                statuses=[ItemStatuses.APPROVED],
+                after_cursor=cursor,
+            )
+            all_items.extend(page.items)
+            if not page.page_info.end_cursor or len(page.items) < 24:
+                break
+            cursor = page.page_info.end_cursor
+        return all_items
 
+    async def get_my_lots(self) -> list[MyLot]:
+        """Возвращает все активные лоты аккаунта с ценой поднятия."""
         async with self._lock:
             account = await self._ensure_account()
-            item = await asyncio.to_thread(account.get_item, None, slug)
-            statuses = await asyncio.to_thread(
-                account.get_item_priority_statuses, item.id, item.price
-            )
+            raw_items = await asyncio.to_thread(self._fetch_all_my_lots_sync, account)
 
-        cheapest = min(statuses, key=lambda s: s.price)
-        return LotInfo(
-            playerok_id=item.id,
-            slug=slug,
-            name=item.name,
-            price_kopecks=int(item.price * 100),
-            bump_cost_kopecks=int(cheapest.price * 100),
-            bump_priority_status_id=cheapest.id,
+        result: list[MyLot] = []
+        for item in raw_items:
+            try:
+                statuses = await self._get_statuses(account, item.id, item.price)
+                cheapest = min(statuses, key=lambda s: s.price)
+                result.append(MyLot(
+                    playerok_id=item.id,
+                    slug=item.slug,
+                    name=item.name,
+                    price_kopecks=int(item.price * 100),
+                    bump_cost_kopecks=int(cheapest.price * 100),
+                    bump_priority_status_id=cheapest.id,
+                ))
+            except Exception:
+                pass
+        return result
+
+    async def _get_statuses(self, account: Account, item_id: str, price: float):
+        return await asyncio.to_thread(
+            account.get_item_priority_statuses, item_id, price
         )
 
     async def refresh_bump_cost(self, playerok_id: str, price_rub: float) -> tuple[int, str]:
@@ -91,7 +120,6 @@ class PlayerokClient:
             status = getattr(item, "status", None)
             if status is None:
                 return True
-            status_str = str(status).upper()
-            return "APPROVED" in status_str or "ACTIVE" in status_str
+            return "APPROVED" in str(status).upper() or "ACTIVE" in str(status).upper()
         except Exception:
             return False
