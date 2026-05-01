@@ -110,13 +110,15 @@ class BumpEngine:
 
     async def _tick(self) -> None:
         now = datetime.now()
-        lots = await self._pick_next_lots(now)
+        now_utc = datetime.utcnow()
+        lots = await self._pick_next_lots(now, now_utc)
         for lot in lots:
             await self._bump_lot(lot)
 
-    async def _pick_next_lots(self, now: datetime) -> list[Lot]:
+    async def _pick_next_lots(self, now: datetime, now_utc: datetime) -> list[Lot]:
         result: list[Lot] = []
         async with self.db.session_factory() as session:
+            # --- Циклы (логика без изменений) ---
             cycles_q = await session.execute(
                 select(Cycle)
                 .where(Cycle.enabled.is_(True))
@@ -127,14 +129,59 @@ class BumpEngine:
                 if lot is not None:
                     result.append(lot)
 
+            # --- Независимые фильтры: глобальный раунд-робин ---
             indep_q = await session.execute(
                 select(Filter)
                 .where(Filter.cycle_id.is_(None), Filter.enabled.is_(True))
                 .options(selectinload(Filter.lots))
             )
-            for flt in indep_q.scalars():
-                result.extend(self._pick_from_independent(flt, now))
+            global_pick = self._pick_independent_global(indep_q.scalars().all(), now_utc)
+            result.extend(global_pick)
+
         return result
+
+    def _pick_independent_global(self, filters: list[Filter], now_utc: datetime) -> list[Lot]:
+        """
+        Глобальный раунд-робин между всеми независимыми фильтрами.
+        Каждую минуту выбирается категория (фильтр), которая ждала дольше всех,
+        и из неё берётся lots_per_trigger лотов с наибольшим временем ожидания.
+        interval_minutes фильтра = минимальное время (мин) между поднятиями одного лота.
+        """
+        filter_candidates: list[tuple[datetime | None, Filter, list[Lot]]] = []
+
+        for flt in filters:
+            if not flt.interval_minutes or not self._filter_has_budget(flt):
+                continue
+
+            eligible: list[Lot] = []
+            for lot in flt.lots:
+                if lot.paused:
+                    continue
+                if lot.last_bumped_at is not None:
+                    elapsed_min = (now_utc - lot.last_bumped_at).total_seconds() / 60
+                    if elapsed_min < flt.interval_minutes:
+                        continue
+                eligible.append(lot)
+
+            if not eligible:
+                continue
+
+            # Сортируем лоты внутри фильтра: давно не поднятые — первые
+            eligible.sort(key=lambda l: (l.last_bumped_at or datetime.min, l.id))
+
+            # «Возраст» фильтра = когда его самый старый лот был поднят в последний раз
+            oldest_bumped = eligible[0].last_bumped_at
+            filter_candidates.append((oldest_bumped, flt, eligible))
+
+        if not filter_candidates:
+            return []
+
+        # Фильтр с never-bumped лотами идёт первым, затем сортировка по времени последнего поднятия
+        filter_candidates.sort(key=lambda x: (x[0] is not None, x[0] or datetime.min))
+
+        _, best_flt, best_lots = filter_candidates[0]
+        n = best_flt.lots_per_trigger or 1
+        return best_lots[:n]
 
     def _pick_from_cycle(self, cycle: Cycle, now: datetime) -> Lot | None:
         active_filters = sorted(
@@ -176,21 +223,6 @@ class BumpEngine:
             if pos_in_cycle == round(i * interval):
                 return i
         return None
-
-    def _pick_from_independent(self, flt: Filter, now: datetime) -> list[Lot]:
-        if not flt.interval_minutes:
-            return []
-        if not self._filter_has_budget(flt):
-            return []
-        if now.minute % flt.interval_minutes != 0:
-            return []
-
-        candidates = sorted(
-            [lot for lot in flt.lots if not lot.paused],
-            key=lambda l: (l.last_bumped_at or datetime.min, l.id),
-        )
-        n = getattr(flt, "lots_per_trigger", 1) or 1
-        return candidates[:n]
 
     @staticmethod
     def _filter_has_budget(flt: Filter) -> bool:
