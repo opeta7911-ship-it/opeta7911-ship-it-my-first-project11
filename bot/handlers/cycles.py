@@ -97,9 +97,26 @@ async def msg_cycle_duration(
         )
         session.add(cycle)
         await session.commit()
+        new_id = cycle.id
     await state.clear()
+    await _send_cycle_card(message, db, new_id)
+
+
+async def _send_cycle_card(message: Message, db: Database, cycle_id: int) -> None:
+    async with db.session_factory() as session:
+        cycle = await session.get(
+            Cycle, cycle_id,
+            options=[selectinload(Cycle.filters).selectinload(Filter.lots)],
+        )
+        if cycle is None:
+            return
+        result = await session.execute(
+            select(Filter).options(selectinload(Filter.lots)).order_by(Filter.id)
+        )
+        all_filters = result.scalars().all()
     await message.answer(
-        f"✅ Цикл «{data['name']}» создан. Открой его и добавь в него фильтры."
+        _format_cycle(cycle, all_filters),
+        reply_markup=cycle_card(cycle, all_filters),
     )
 
 

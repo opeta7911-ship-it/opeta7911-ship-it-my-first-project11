@@ -55,6 +55,14 @@ async def _open_filter(call: CallbackQuery, db: Database, filter_id: int) -> Non
     await call.answer()
 
 
+async def _send_filter_card(message: Message, db: Database, filter_id: int) -> None:
+    async with db.session_factory() as session:
+        flt = await session.get(Filter, filter_id, options=[selectinload(Filter.lots)])
+        if flt is None:
+            return
+    await message.answer(_format_filter(flt), reply_markup=filter_card(flt))
+
+
 @router.callback_query(F.data == "filters")
 async def cb_filters(call: CallbackQuery, db: Database) -> None:
     async with db.session_factory() as session:
@@ -86,8 +94,9 @@ async def msg_filter_name(message: Message, state: FSMContext, db: Database) -> 
         flt = Filter(name=name)
         session.add(flt)
         await session.commit()
+        new_id = flt.id
     await state.clear()
-    await message.answer(f"✅ Фильтр «{name}» создан.\nТеперь выбери лоты через «📋 Выбрать лоты».")
+    await _send_filter_card(message, db, new_id)
 
 
 @router.callback_query(F.data.startswith("filter:"))
@@ -301,7 +310,7 @@ async def msg_interval_custom(message: Message, state: FSMContext, db: Database)
             flt.interval_minutes = minutes
             await session.commit()
     await state.clear()
-    await message.answer(f"✅ Интервал: каждые {minutes} мин.")
+    await _send_filter_card(message, db, fid)
 
 
 # ── Лотов за раз ───────────────────────────────────────────────────────────
@@ -361,7 +370,7 @@ async def msg_filter_limit(message: Message, state: FSMContext, db: Database) ->
             flt.spent_kopecks = 0
             await session.commit()
     await state.clear()
-    await message.answer("✅ Лимит сохранён." if rub > 0 else "✅ Лимит снят.")
+    await _send_filter_card(message, db, fid)
 
 
 # ── Назначение цикла ───────────────────────────────────────────────────────
