@@ -29,7 +29,12 @@ PAGE_SIZE = 8
 def _format_filter(flt: Filter) -> str:
     lines = [f"<b>Фильтр: {flt.name}</b>", ""]
     lines.append(f"Состояние: {'🟢 ВКЛ' if flt.enabled else '🔴 ВЫКЛ'}")
-    lines.append(f"Лотов: {len(flt.lots)}")
+    if flt.lots:
+        lines.append(f"Лотов: {len(flt.lots)}")
+        for lot in flt.lots:
+            lines.append(f"  • {lot.name} · {lot.price_kopecks // 100}₽")
+    else:
+        lines.append("Лотов: 0")
     if flt.interval_minutes:
         lines.append(f"Поднимать: каждые {flt.interval_minutes} мин")
     else:
