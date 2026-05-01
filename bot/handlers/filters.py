@@ -32,7 +32,7 @@ def _format_filter(flt: Filter) -> str:
     if flt.lots:
         lines.append(f"Лотов: {len(flt.lots)}")
         for lot in flt.lots:
-            lines.append(f"  • {lot.name} · {lot.price_kopecks // 100}₽")
+            lines.append(f'  • <a href="{lot.url}">{lot.name}</a> · {lot.price_kopecks // 100}₽')
     else:
         lines.append("Лотов: 0")
     if flt.interval_minutes:
@@ -56,7 +56,11 @@ async def _open_filter(call: CallbackQuery, db: Database, filter_id: int) -> Non
         if flt is None:
             await call.answer("Фильтр не найден")
             return
-    await call.message.edit_text(_format_filter(flt), reply_markup=filter_card(flt))
+    await call.message.edit_text(
+        _format_filter(flt),
+        reply_markup=filter_card(flt),
+        disable_web_page_preview=True,
+    )
     await call.answer()
 
 
@@ -65,7 +69,11 @@ async def _send_filter_card(message: Message, db: Database, filter_id: int) -> N
         flt = await session.get(Filter, filter_id, options=[selectinload(Filter.lots)])
         if flt is None:
             return
-    await message.answer(_format_filter(flt), reply_markup=filter_card(flt))
+    await message.answer(
+        _format_filter(flt),
+        reply_markup=filter_card(flt),
+        disable_web_page_preview=True,
+    )
 
 
 @router.callback_query(F.data == "filters")
