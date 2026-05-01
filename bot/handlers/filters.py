@@ -178,16 +178,20 @@ async def cb_lot_toggle(call: CallbackQuery, db: Database, playerok: PlayerokCli
             await session.delete(existing)
         else:
             try:
+                # Берём лот из кэша страницы (уже загружен) и запрашиваем цену поднятия
                 all_lots = await playerok.get_my_lots()
                 lot_info = next((l for l in all_lots if l.playerok_id == playerok_id), None)
                 if lot_info:
+                    cost, _ = await playerok.get_lot_bump_cost(
+                        lot_info.playerok_id, lot_info.price_kopecks / 100
+                    )
                     session.add(Lot(
                         filter_id=fid,
                         playerok_id=lot_info.playerok_id,
                         url=lot_info.url,
                         name=lot_info.name,
                         price_kopecks=lot_info.price_kopecks,
-                        bump_cost_kopecks=lot_info.bump_cost_kopecks,
+                        bump_cost_kopecks=cost,
                     ))
             except Exception as exc:
                 logger.exception("Failed to add lot %s", playerok_id)

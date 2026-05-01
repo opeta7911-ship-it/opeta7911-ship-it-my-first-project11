@@ -69,29 +69,32 @@ class PlayerokClient:
         return all_items
 
     async def get_my_lots(self) -> list[MyLot]:
-        """Возвращает все активные лоты аккаунта с ценой поднятия."""
+        """Возвращает список активных лотов аккаунта (без запроса цены поднятия)."""
         async with self._lock:
             account = await self._ensure_account()
             raw_items = await asyncio.to_thread(self._fetch_all_my_lots_sync, account)
 
-        result: list[MyLot] = []
-        for item in raw_items:
-            try:
-                statuses = await self._get_statuses(account, item.id, item.price)
-                cheapest = min(statuses, key=lambda s: s.price)
-                result.append(MyLot(
-                    playerok_id=item.id,
-                    slug=item.slug,
-                    name=item.name,
-                    price_kopecks=int(item.price * 100),
-                    bump_cost_kopecks=int(cheapest.price * 100),
-                    bump_priority_status_id=cheapest.id,
-                ))
-            except Exception:
-                pass
-        return result
+        return [
+            MyLot(
+                playerok_id=item.id,
+                slug=item.slug,
+                name=item.name,
+                price_kopecks=int(item.price * 100),
+                bump_cost_kopecks=0,
+                bump_priority_status_id="",
+            )
+            for item in raw_items
+        ]
 
-    async def _get_statuses(self, account: Account, item_id: str, price: float):
+    async def get_lot_bump_cost(self, playerok_id: str, price_rub: float) -> tuple[int, str]:
+        """Запрашивает актуальную стоимость поднятия для конкретного лота."""
+        async with self._lock:
+            account = await self._ensure_account()
+            statuses = await asyncio.to_thread(
+                account.get_item_priority_statuses, playerok_id, price_rub
+            )
+        cheapest = min(statuses, key=lambda s: s.price)
+        return int(cheapest.price * 100), cheapest.id
         return await asyncio.to_thread(
             account.get_item_priority_statuses, item_id, price
         )
