@@ -31,15 +31,16 @@ async def cmd_stats(message: Message) -> None:
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(call: CallbackQuery, bump_engine) -> None:
+    await call.answer()
     await call.message.edit_text(
         _greeting(bump_engine.enabled),
         reply_markup=main_menu(bump_engine.enabled),
     )
-    await call.answer()
 
 
 @router.callback_query(F.data == "toggle_engine")
 async def cb_toggle_engine(call: CallbackQuery, bump_engine) -> None:
+    await call.answer()
     if bump_engine.enabled:
         await bump_engine.stop()
     else:
@@ -48,18 +49,17 @@ async def cb_toggle_engine(call: CallbackQuery, bump_engine) -> None:
         _greeting(bump_engine.enabled),
         reply_markup=main_menu(bump_engine.enabled),
     )
-    await call.answer("Готово")
 
 
 @router.callback_query(F.data == "settings")
 async def cb_settings(call: CallbackQuery) -> None:
+    await call.answer()
     await call.message.edit_text(
         "<b>Настройки</b>\n\n"
         "Cookies и user-agent Playerok задаются через .env (PLAYEROK_COOKIES, "
         "PLAYEROK_USER_AGENT). Перезапусти бота после изменения.",
         reply_markup=main_menu_back(),
     )
-    await call.answer()
 
 
 def main_menu_back():

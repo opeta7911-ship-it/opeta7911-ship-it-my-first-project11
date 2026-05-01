@@ -54,14 +54,16 @@ async def _open_filter(call: CallbackQuery, db: Database, filter_id: int) -> Non
     async with db.session_factory() as session:
         flt = await session.get(Filter, filter_id, options=[selectinload(Filter.lots)])
         if flt is None:
-            await call.answer("Фильтр не найден")
+            await call.answer("Фильтр не найден", show_alert=True)
             return
-    await call.message.edit_text(
-        _format_filter(flt),
-        reply_markup=filter_card(flt),
-        disable_web_page_preview=True,
-    )
-    await call.answer()
+    try:
+        await call.message.edit_text(
+            _format_filter(flt),
+            reply_markup=filter_card(flt),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass  # message already has same content
 
 
 async def _send_filter_card(message: Message, db: Database, filter_id: int) -> None:
@@ -78,6 +80,7 @@ async def _send_filter_card(message: Message, db: Database, filter_id: int) -> N
 
 @router.callback_query(F.data == "filters")
 async def cb_filters(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
     async with db.session_factory() as session:
         result = await session.execute(
             select(Filter).options(selectinload(Filter.lots)).order_by(Filter.order_index, Filter.id)
@@ -87,17 +90,16 @@ async def cb_filters(call: CallbackQuery, db: Database) -> None:
         "<b>Фильтры</b>\n\nКаждый фильтр — один набор лотов с общими настройками поднятия.",
         reply_markup=filters_menu(flts),
     )
-    await call.answer()
 
 
 @router.callback_query(F.data == "filter_create")
 async def cb_filter_create(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
     await state.set_state(FilterCreate.waiting_for_name)
     await call.message.edit_text(
         "Введи название фильтра (например, «80 Робуксов»):",
         reply_markup=back_button("filters"),
     )
-    await call.answer()
 
 
 @router.message(FilterCreate.waiting_for_name)
@@ -113,13 +115,16 @@ async def msg_filter_name(message: Message, state: FSMContext, db: Database) -> 
 
 
 @router.callback_query(F.data.startswith("filter:"))
-async def cb_filter_open(call: CallbackQuery, db: Database) -> None:
+async def cb_filter_open(call: CallbackQuery, db: Database, state: FSMContext) -> None:
+    await call.answer()
+    await state.update_data(lots_cache=[])  # сбрасываем кэш лотов при возврате в карточку
     fid = int(call.data.split(":")[1])
     await _open_filter(call, db, fid)
 
 
 @router.callback_query(F.data.startswith("filter_toggle:"))
 async def cb_filter_toggle(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
     fid = int(call.data.split(":")[1])
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid)
@@ -131,13 +136,13 @@ async def cb_filter_toggle(call: CallbackQuery, db: Database) -> None:
 
 @router.callback_query(F.data.startswith("filter_delete:"))
 async def cb_filter_delete(call: CallbackQuery, db: Database) -> None:
+    await call.answer("Удалено")
     fid = int(call.data.split(":")[1])
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid)
         if flt:
             await session.delete(flt)
             await session.commit()
-    await call.answer("Удалено")
     await cb_filters(call, db)
 
 
@@ -147,40 +152,61 @@ async def cb_filter_delete(call: CallbackQuery, db: Database) -> None:
 async def cb_filter_lots_fetch(
     call: CallbackQuery, db: Database, playerok: PlayerokClient, state: FSMContext
 ) -> None:
+    await call.answer()
     parts = call.data.split(":")
     fid, page = int(parts[1]), int(parts[2])
 
-    await call.message.edit_text("⏳ Загружаю лоты с Playerok...")
-    await call.answer()
+    fsm_data = await state.get_data()
+    cached = fsm_data.get("lots_cache", [])
 
-    try:
-        all_lots = await playerok.get_my_lots()
-    except Exception as exc:
-        await call.message.edit_text(
-            f"❌ Не удалось загрузить лоты: {exc}",
-            reply_markup=back_button(f"filter:{fid}"),
-        )
-        return
-
-    if not all_lots:
-        await call.message.edit_text(
-            "На Playerok нет активных лотов.",
-            reply_markup=back_button(f"filter:{fid}"),
-        )
-        return
-
-    # Кэшируем список лотов в FSM, чтобы не перезапрашивать при каждом нажатии
-    await state.update_data(
-        lots_cache=[
-            {
-                "playerok_id": l.playerok_id,
-                "slug": l.slug,
-                "name": l.name,
-                "price_kopecks": l.price_kopecks,
-            }
-            for l in all_lots
+    if cached:
+        # Пагинация — используем кэш, Playerok не трогаем
+        from playerok.client import MyLot
+        all_lots = [
+            MyLot(
+                playerok_id=l["playerok_id"],
+                slug=l["slug"],
+                name=l["name"],
+                price_kopecks=l["price_kopecks"],
+                bump_cost_kopecks=0,
+                bump_priority_status_id="",
+            )
+            for l in cached
         ]
-    )
+    else:
+        # Первое открытие — загружаем с Playerok и кэшируем
+        try:
+            await call.message.edit_text("⏳ Загружаю лоты с Playerok...")
+        except Exception:
+            pass
+        try:
+            all_lots = await playerok.get_my_lots()
+        except Exception as exc:
+            try:
+                await call.message.edit_text(
+                    f"❌ Не удалось загрузить лоты: {exc}",
+                    reply_markup=back_button(f"filter:{fid}"),
+                )
+            except Exception:
+                pass
+            return
+        if not all_lots:
+            await call.message.edit_text(
+                "На Playerok нет активных лотов.",
+                reply_markup=back_button(f"filter:{fid}"),
+            )
+            return
+        await state.update_data(
+            lots_cache=[
+                {
+                    "playerok_id": l.playerok_id,
+                    "slug": l.slug,
+                    "name": l.name,
+                    "price_kopecks": l.price_kopecks,
+                }
+                for l in all_lots
+            ]
+        )
 
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid, options=[selectinload(Filter.lots)])
@@ -192,11 +218,14 @@ async def cb_filter_lots_fetch(
     start = page * PAGE_SIZE
     page_lots = all_lots[start: start + PAGE_SIZE]
 
-    await call.message.edit_text(
-        f"<b>Выбери лоты для фильтра «{flt.name}»</b>\n"
-        f"Выбрано: {len(selected_ids)} из {len(all_lots)}",
-        reply_markup=lot_selection_menu(fid, page_lots, selected_ids, page, len(all_lots), PAGE_SIZE),
-    )
+    try:
+        await call.message.edit_text(
+            f"<b>Выбери лоты для фильтра «{flt.name}»</b>\n"
+            f"Выбрано: {len(selected_ids)} из {len(all_lots)}",
+            reply_markup=lot_selection_menu(fid, page_lots, selected_ids, page, len(all_lots), PAGE_SIZE),
+        )
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("lot_toggle:"))
@@ -269,29 +298,30 @@ async def cb_lot_toggle(
 
 @router.callback_query(F.data.startswith("filter_interval_menu:"))
 async def cb_filter_interval_menu(call: CallbackQuery) -> None:
+    await call.answer()
     fid = int(call.data.split(":")[1])
     await call.message.edit_text(
         "Как часто поднимать лоты?",
         reply_markup=interval_menu(fid),
     )
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("filter_interval_set:"))
 async def cb_filter_interval_set(call: CallbackQuery, db: Database) -> None:
     parts = call.data.split(":")
     fid, minutes = int(parts[1]), int(parts[2])
+    await call.answer("✅ Сохранено")
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid)
         if flt:
             flt.interval_minutes = minutes
             await session.commit()
-    await call.answer("✅ Сохранено")
     await _open_filter(call, db, fid)
 
 
 @router.callback_query(F.data.startswith("filter_interval_custom:"))
 async def cb_filter_interval_custom(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
     fid = int(call.data.split(":")[1])
     await state.set_state(FilterEditIntervalCustom.waiting_for_minutes)
     await state.update_data(filter_id=fid)
@@ -299,7 +329,6 @@ async def cb_filter_interval_custom(call: CallbackQuery, state: FSMContext) -> N
         "Введи интервал в минутах (например, 45):",
         reply_markup=back_button(f"filter:{fid}"),
     )
-    await call.answer()
 
 
 @router.message(FilterEditIntervalCustom.waiting_for_minutes)
@@ -325,24 +354,24 @@ async def msg_interval_custom(message: Message, state: FSMContext, db: Database)
 
 @router.callback_query(F.data.startswith("filter_lpt_menu:"))
 async def cb_filter_lpt_menu(call: CallbackQuery) -> None:
+    await call.answer()
     fid = int(call.data.split(":")[1])
     await call.message.edit_text(
         "Сколько лотов поднимать за одно срабатывание?",
         reply_markup=lots_per_trigger_menu(fid),
     )
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("filter_lpt_set:"))
 async def cb_filter_lpt_set(call: CallbackQuery, db: Database) -> None:
     parts = call.data.split(":")
     fid, n = int(parts[1]), int(parts[2])
+    await call.answer("✅ Сохранено")
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid)
         if flt:
             flt.lots_per_trigger = n
             await session.commit()
-    await call.answer("✅ Сохранено")
     await _open_filter(call, db, fid)
 
 
@@ -350,6 +379,7 @@ async def cb_filter_lpt_set(call: CallbackQuery, db: Database) -> None:
 
 @router.callback_query(F.data.startswith("filter_limit:"))
 async def cb_filter_limit(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
     fid = int(call.data.split(":")[1])
     await state.set_state(FilterEditLimit.waiting_for_amount)
     await state.update_data(filter_id=fid)
@@ -359,7 +389,6 @@ async def cb_filter_limit(call: CallbackQuery, state: FSMContext) -> None:
         "0 — убрать лимит:",
         reply_markup=back_button(f"filter:{fid}"),
     )
-    await call.answer()
 
 
 @router.message(FilterEditLimit.waiting_for_amount)
@@ -393,11 +422,11 @@ async def cb_filter_cycle_assign(call: CallbackQuery, db: Database) -> None:
     if not cycles:
         await call.answer("Сначала создай цикл в разделе «Циклы».", show_alert=True)
         return
+    await call.answer()
     await call.message.edit_text(
         "Выбери цикл для этого фильтра:",
         reply_markup=filter_cycle_assign_menu(fid, cycles, flt.cycle_id if flt else None),
     )
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("filter_cycle_set:"))

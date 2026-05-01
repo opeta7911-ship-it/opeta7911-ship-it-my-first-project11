@@ -36,6 +36,7 @@ def _format_cycle(cycle: Cycle, all_filters: list[Filter]) -> str:
 
 @router.callback_query(F.data == "cycles")
 async def cb_cycles(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
     async with db.session_factory() as session:
         result = await session.execute(select(Cycle).order_by(Cycle.id))
         cycles = result.scalars().all()
@@ -44,17 +45,16 @@ async def cb_cycles(call: CallbackQuery, db: Database) -> None:
         "с авто-распределением по минутам.",
         reply_markup=cycles_menu(cycles),
     )
-    await call.answer()
 
 
 @router.callback_query(F.data == "cycle_create")
 async def cb_cycle_create(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
     await state.set_state(CycleCreate.waiting_for_name)
     await call.message.edit_text(
         "Введи название цикла (например, «60 робуксов в час»):",
         reply_markup=back_button("cycles"),
     )
-    await call.answer()
 
 
 @router.message(CycleCreate.waiting_for_name)
@@ -128,27 +128,31 @@ async def _open_cycle(call: CallbackQuery, db: Database, cycle_id: int) -> None:
             options=[selectinload(Cycle.filters).selectinload(Filter.lots)],
         )
         if cycle is None:
-            await call.answer("Цикл не найден")
+            await call.answer("Цикл не найден", show_alert=True)
             return
         result = await session.execute(
             select(Filter).options(selectinload(Filter.lots)).order_by(Filter.id)
         )
         all_filters = result.scalars().all()
-    await call.message.edit_text(
-        _format_cycle(cycle, all_filters),
-        reply_markup=cycle_card(cycle, all_filters),
-    )
-    await call.answer()
+    try:
+        await call.message.edit_text(
+            _format_cycle(cycle, all_filters),
+            reply_markup=cycle_card(cycle, all_filters),
+        )
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("cycle:"))
 async def cb_cycle_open(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
     cid = int(call.data.split(":")[1])
     await _open_cycle(call, db, cid)
 
 
 @router.callback_query(F.data.startswith("cycle_toggle:"))
 async def cb_cycle_toggle(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
     cid = int(call.data.split(":")[1])
     async with db.session_factory() as session:
         cycle = await session.get(Cycle, cid)
@@ -160,6 +164,7 @@ async def cb_cycle_toggle(call: CallbackQuery, db: Database) -> None:
 
 @router.callback_query(F.data.startswith("cycle_delete:"))
 async def cb_cycle_delete(call: CallbackQuery, db: Database) -> None:
+    await call.answer("Удалено")
     cid = int(call.data.split(":")[1])
     async with db.session_factory() as session:
         result = await session.execute(
@@ -171,12 +176,12 @@ async def cb_cycle_delete(call: CallbackQuery, db: Database) -> None:
         if cycle:
             await session.delete(cycle)
             await session.commit()
-    await call.answer("Удалено")
     await cb_cycles(call, db)
 
 
 @router.callback_query(F.data.startswith("cycle_togglefilter:"))
 async def cb_cycle_togglefilter(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
     _, cid_s, fid_s = call.data.split(":")
     cid, fid = int(cid_s), int(fid_s)
     async with db.session_factory() as session:
