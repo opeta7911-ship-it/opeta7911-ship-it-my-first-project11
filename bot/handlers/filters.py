@@ -121,7 +121,9 @@ async def cb_filter_delete(call: CallbackQuery, db: Database) -> None:
 # ── Выбор лотов из списка ──────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("filter_lots_fetch:"))
-async def cb_filter_lots_fetch(call: CallbackQuery, db: Database, playerok: PlayerokClient) -> None:
+async def cb_filter_lots_fetch(
+    call: CallbackQuery, db: Database, playerok: PlayerokClient, state: FSMContext
+) -> None:
     parts = call.data.split(":")
     fid, page = int(parts[1]), int(parts[2])
 
@@ -144,6 +146,19 @@ async def cb_filter_lots_fetch(call: CallbackQuery, db: Database, playerok: Play
         )
         return
 
+    # Кэшируем список лотов в FSM, чтобы не перезапрашивать при каждом нажатии
+    await state.update_data(
+        lots_cache=[
+            {
+                "playerok_id": l.playerok_id,
+                "slug": l.slug,
+                "name": l.name,
+                "price_kopecks": l.price_kopecks,
+            }
+            for l in all_lots
+        ]
+    )
+
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid, options=[selectinload(Filter.lots)])
         if not flt:
@@ -162,53 +177,74 @@ async def cb_filter_lots_fetch(call: CallbackQuery, db: Database, playerok: Play
 
 
 @router.callback_query(F.data.startswith("lot_toggle:"))
-async def cb_lot_toggle(call: CallbackQuery, db: Database, playerok: PlayerokClient) -> None:
+async def cb_lot_toggle(
+    call: CallbackQuery, db: Database, playerok: PlayerokClient, state: FSMContext
+) -> None:
     parts = call.data.split(":")
     fid, playerok_id, page = int(parts[1]), parts[2], int(parts[3])
 
-    await call.answer()
+    # Мгновенно обновляем клавиатуру из кэша — без лишних запросов к Playerok
+    fsm_data = await state.get_data()
+    cached = fsm_data.get("lots_cache", [])
 
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid, options=[selectinload(Filter.lots)])
         if not flt:
+            await call.answer()
             return
 
         existing = next((l for l in flt.lots if l.playerok_id == playerok_id), None)
         if existing:
             await session.delete(existing)
         else:
-            try:
-                # Берём лот из кэша страницы (уже загружен) и запрашиваем цену поднятия
-                all_lots = await playerok.get_my_lots()
-                lot_info = next((l for l in all_lots if l.playerok_id == playerok_id), None)
-                if lot_info:
+            lot_info = next((l for l in cached if l["playerok_id"] == playerok_id), None)
+            if lot_info:
+                try:
                     cost, _ = await playerok.get_lot_bump_cost(
-                        lot_info.playerok_id, lot_info.price_kopecks / 100
+                        lot_info["playerok_id"], lot_info["price_kopecks"] / 100
                     )
-                    session.add(Lot(
-                        filter_id=fid,
-                        playerok_id=lot_info.playerok_id,
-                        url=lot_info.url,
-                        name=lot_info.name,
-                        price_kopecks=lot_info.price_kopecks,
-                        bump_cost_kopecks=cost,
-                    ))
-            except Exception as exc:
-                logger.exception("Failed to add lot %s", playerok_id)
+                except Exception:
+                    logger.exception("Failed to fetch bump cost for %s", playerok_id)
+                    cost = 0
+                from playerok.client import BASE_URL
+                session.add(Lot(
+                    filter_id=fid,
+                    playerok_id=lot_info["playerok_id"],
+                    url=f"{BASE_URL}{lot_info['slug']}",
+                    name=lot_info["name"],
+                    price_kopecks=lot_info["price_kopecks"],
+                    bump_cost_kopecks=cost,
+                ))
         await session.commit()
         await session.refresh(flt, ["lots"])
         selected_ids = {l.playerok_id for l in flt.lots}
 
-    try:
-        all_lots = await playerok.get_my_lots()
-    except Exception:
-        all_lots = []
+    # Если кэш есть — перерисовываем клавиатуру мгновенно, без API-запроса
+    if cached:
+        from playerok.client import MyLot
+        all_lots = [
+            MyLot(
+                playerok_id=l["playerok_id"],
+                slug=l["slug"],
+                name=l["name"],
+                price_kopecks=l["price_kopecks"],
+                bump_cost_kopecks=0,
+                bump_priority_status_id="",
+            )
+            for l in cached
+        ]
+    else:
+        try:
+            all_lots = await playerok.get_my_lots()
+        except Exception:
+            all_lots = []
 
     start = page * PAGE_SIZE
     page_lots = all_lots[start: start + PAGE_SIZE]
     await call.message.edit_reply_markup(
         reply_markup=lot_selection_menu(fid, page_lots, selected_ids, page, len(all_lots), PAGE_SIZE)
     )
+    await call.answer()
 
 
 # ── Интервал поднятия ──────────────────────────────────────────────────────
