@@ -233,6 +233,8 @@ class BumpEngine:
             lot = await session.get(Lot, lot_id, options=[selectinload(Lot.filter)])
             if lot is None:
                 return
+            # Обновляем last_bumped_at чтобы сломанный лот не застревал в начале очереди
+            lot.last_bumped_at = datetime.utcnow()
             session.add(BumpHistory(lot_id=lot.id, success=False, error=error))
             await session.commit()
             await self.on_result(lot, False, 0, error)

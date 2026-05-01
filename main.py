@@ -30,15 +30,20 @@ async def main() -> None:
     )
 
     async def on_bump_result(lot: Lot, success: bool, cost_kopecks: int, error: str | None) -> None:
+        # Короткий идентификатор из URL — чтобы видеть что поднимаются РАЗНЫЕ лоты
+        # (даже если у нескольких лотов одинаковое название на Playerok)
+        slug_id = lot.url.rsplit("/", 1)[-1].split("-", 1)[0][:8]
         if success:
             text = (
                 f'🚀 <a href="{lot.url}">{lot.name}</a>\n'
-                f"Поднято ✅  ({cost_kopecks / 100:.0f}₽ / {lot.price_kopecks / 100:.0f}₽)"
+                f"Поднято ✅  ({cost_kopecks / 100:.0f}₽ / {lot.price_kopecks / 100:.0f}₽)\n"
+                f"<code>#{lot.id} · {slug_id}</code>"
             )
         else:
             text = (
                 f'❌ <a href="{lot.url}">{lot.name}</a>\n'
-                f"Не поднят — {error or 'неизвестная ошибка'}"
+                f"Не поднят — {error or 'неизвестная ошибка'}\n"
+                f"<code>#{lot.id} · {slug_id}</code>"
             )
         try:
             await bot.send_message(config.admin_id, text, disable_web_page_preview=True)
