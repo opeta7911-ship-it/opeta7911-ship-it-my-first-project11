@@ -52,9 +52,9 @@ def filter_card(flt: Filter) -> InlineKeyboardMarkup:
     if flt.spend_limit_kopecks is not None:
         lim = flt.spend_limit_kopecks // 100
         spent = flt.spent_kopecks // 100
-        kb.button(text=f"💰 Лимит: {spent}₽/{lim}₽", callback_data=f"filter_limit:{flt.id}")
+        kb.button(text=f"💰 Лимит/сутки: {spent}₽/{lim}₽", callback_data=f"filter_limit:{flt.id}")
     else:
-        kb.button(text="💰 Лимит: нет", callback_data=f"filter_limit:{flt.id}")
+        kb.button(text="💰 Лимит/сутки: нет", callback_data=f"filter_limit:{flt.id}")
     kb.button(text="🔄 В цикл", callback_data=f"filter_cycle_assign:{flt.id}")
     kb.button(text="🗑 Удалить", callback_data=f"filter_delete:{flt.id}")
     kb.button(text="◀️ Назад", callback_data="filters")

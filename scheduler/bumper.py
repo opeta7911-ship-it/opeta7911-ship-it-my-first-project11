@@ -3,7 +3,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from database.db import Database
@@ -13,6 +13,50 @@ from playerok.client import PlayerokClient
 logger = logging.getLogger(__name__)
 
 BumpCallback = Callable[[Lot, bool, int, str | None], Awaitable[None]]
+
+
+class DailyResetTask:
+    """Сбрасывает потраченный бюджет фильтров каждый день в 12:00 по местному времени."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        if self._task and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run(self) -> None:
+        while True:
+            await self._sleep_until_noon()
+            await self._reset_budgets()
+
+    async def _sleep_until_noon(self) -> None:
+        now = datetime.now()
+        noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        if now >= noon:
+            noon += timedelta(days=1)
+        await asyncio.sleep((noon - now).total_seconds())
+
+    async def _reset_budgets(self) -> None:
+        now = datetime.now()
+        async with self.db.session_factory() as session:
+            await session.execute(
+                update(Filter)
+                .where(Filter.spend_limit_kopecks.isnot(None))
+                .values(spent_kopecks=0, limit_reset_at=now)
+            )
+            await session.commit()
+        logger.info("Daily limit reset executed at %s", now.strftime("%H:%M"))
 
 
 class BumpEngine:

@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -7,6 +8,10 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from database.models import Base
+
+_MIGRATIONS = [
+    "ALTER TABLE filters ADD COLUMN limit_reset_at DATETIME",
+]
 
 
 class Database:
@@ -19,6 +24,11 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            for sql in _MIGRATIONS:
+                try:
+                    await conn.execute(text(sql))
+                except Exception:
+                    pass  # column already exists
 
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.session_factory() as session:

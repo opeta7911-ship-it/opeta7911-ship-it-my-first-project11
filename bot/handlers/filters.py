@@ -36,9 +36,10 @@ def _format_filter(flt: Filter) -> str:
         lines.append("Поднимать: ⚠️ не настроено")
     lines.append(f"Лотов за раз: {flt.lots_per_trigger}")
     if flt.spend_limit_kopecks is not None:
-        lines.append(f"Лимит: {flt.spent_kopecks//100}₽ / {flt.spend_limit_kopecks//100}₽")
+        reset_info = f" · сброс в 12:00" if flt.limit_reset_at else ""
+        lines.append(f"Лимит/сутки: {flt.spent_kopecks//100}₽ / {flt.spend_limit_kopecks//100}₽{reset_info}")
     else:
-        lines.append("Лимит: нет")
+        lines.append("Лимит/сутки: нет")
     if flt.cycle_id:
         lines.append(f"Цикл: #{flt.cycle_id}")
     return "\n".join(lines)
@@ -336,7 +337,9 @@ async def cb_filter_limit(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(FilterEditLimit.waiting_for_amount)
     await state.update_data(filter_id=fid)
     await call.message.edit_text(
-        "Введи лимит расходов в рублях (например 864).\n0 — убрать лимит:",
+        "Введи суточный лимит расходов в рублях (например 864).\n"
+        "Лимит сбрасывается каждый день в 12:00 по местному времени.\n"
+        "0 — убрать лимит:",
         reply_markup=back_button(f"filter:{fid}"),
     )
     await call.answer()
@@ -384,12 +387,23 @@ async def cb_filter_cycle_assign(call: CallbackQuery, db: Database) -> None:
 async def cb_filter_cycle_set(call: CallbackQuery, db: Database) -> None:
     parts = call.data.split(":")
     fid, cid = int(parts[1]), int(parts[2])
+    lpt_reset = False
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid)
         if flt:
             flt.cycle_id = cid if cid > 0 else None
+            if cid > 0 and flt.lots_per_trigger > 1:
+                flt.lots_per_trigger = 1
+                lpt_reset = True
             await session.commit()
-    await call.answer("✅ Сохранено")
+    if lpt_reset:
+        await call.answer(
+            "⚠️ В цикле можно поднимать только 1 лот за раз.\n"
+            "«Лотов за раз» автоматически изменено на 1.",
+            show_alert=True,
+        )
+    else:
+        await call.answer("✅ Сохранено")
     await _open_filter(call, db, fid)
 
 
