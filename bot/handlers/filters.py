@@ -201,19 +201,20 @@ async def cb_filter_lots_fetch(
 
 @router.callback_query(F.data.startswith("lot_toggle:"))
 async def cb_lot_toggle(
-    call: CallbackQuery, db: Database, playerok: PlayerokClient, state: FSMContext
+    call: CallbackQuery, db: Database, state: FSMContext
 ) -> None:
     parts = call.data.split(":")
     fid, playerok_id, page = int(parts[1]), parts[2], int(parts[3])
 
-    # Мгновенно обновляем клавиатуру из кэша — без лишних запросов к Playerok
+    # Отвечаем сразу — Telegram убирает спиннер не дожидаясь конца обработки
+    await call.answer()
+
     fsm_data = await state.get_data()
     cached = fsm_data.get("lots_cache", [])
 
     async with db.session_factory() as session:
         flt = await session.get(Filter, fid, options=[selectinload(Filter.lots)])
         if not flt:
-            await call.answer()
             return
 
         existing = next((l for l in flt.lots if l.playerok_id == playerok_id), None)
@@ -222,21 +223,15 @@ async def cb_lot_toggle(
         else:
             lot_info = next((l for l in cached if l["playerok_id"] == playerok_id), None)
             if lot_info:
-                try:
-                    cost, _ = await playerok.get_lot_bump_cost(
-                        lot_info["playerok_id"], lot_info["price_kopecks"] / 100
-                    )
-                except Exception:
-                    logger.exception("Failed to fetch bump cost for %s", playerok_id)
-                    cost = 0
                 from playerok.client import BASE_URL
+                # bump_cost сохраняем 0 — планировщик обновит цену прямо перед поднятием
                 session.add(Lot(
                     filter_id=fid,
                     playerok_id=lot_info["playerok_id"],
                     url=f"{BASE_URL}{lot_info['slug']}",
                     name=lot_info["name"],
                     price_kopecks=lot_info["price_kopecks"],
-                    bump_cost_kopecks=cost,
+                    bump_cost_kopecks=0,
                 ))
         await session.commit()
         await session.refresh(flt, ["lots"])
