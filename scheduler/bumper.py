@@ -152,6 +152,8 @@ class BumpEngine:
         now = datetime.now()
         now_utc = datetime.utcnow()
         lots = await self._pick_next_lots(now, now_utc)
+        if not lots:
+            logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
         for lot in lots:
             await self._bump_lot(lot)
 
@@ -248,6 +250,12 @@ class BumpEngine:
 
         # minute → all lots for the filter that fires at that minute
         schedule = self._build_cycle_schedule(per_filter, cycle.duration_minutes)
+        total_lots = sum(len(f) for f in per_filter)
+        filled = len(schedule)
+        logger.info(
+            "CYCLE '%s': %d filters, %d lots, %d/%d min filled",
+            cycle.name, len(per_filter), total_lots, filled, cycle.duration_minutes,
+        )
 
         try:
             sh, sm = (int(p) for p in cycle.start_time.split(":"))
@@ -261,13 +269,19 @@ class BumpEngine:
 
         filter_lots = schedule.get(pos_in_cycle)
         if not filter_lots:
+            logger.debug("CYCLE '%s' pos=%d — empty slot", cycle.name, pos_in_cycle)
             return None
 
-        # Pick the lot in this filter that was bumped the longest ago
-        return min(
+        lot = min(
             filter_lots,
             key=lambda l: (l.last_bumped_at is not None, l.last_bumped_at or datetime.min, l.id),
         )
+        logger.info(
+            "CYCLE '%s' pos=%d — lot #%d last_bumped=%s",
+            cycle.name, pos_in_cycle, lot.id,
+            lot.last_bumped_at.strftime("%H:%M") if lot.last_bumped_at else "never",
+        )
+        return lot
 
     @staticmethod
     def _build_cycle_schedule(
