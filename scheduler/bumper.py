@@ -239,13 +239,13 @@ class BumpEngine:
 
             def _lot_key(l: Lot):
                 on_cd = _elapsed(l) < flt.interval_minutes
-                # Priority: 1) not on cooldown  2) never bumped  3) oldest bump  4) soonest expiry
+                # Priority: 1) not on cooldown  2) soonest expiry  3) oldest bump
                 return (
                     on_cd,
-                    l.last_bumped_at is not None,
-                    l.last_bumped_at or datetime.min,
                     l.expires_at is None,
                     l.expires_at or datetime.max,
+                    l.last_bumped_at is not None,
+                    l.last_bumped_at or datetime.min,
                     l.id,
                 )
 
@@ -323,10 +323,10 @@ class BumpEngine:
         lot = min(
             filter_lots,
             key=lambda l: (
-                l.last_bumped_at is not None,
-                l.last_bumped_at or datetime.min,
                 l.expires_at is None,
                 l.expires_at or datetime.max,
+                l.last_bumped_at is not None,
+                l.last_bumped_at or datetime.min,
                 l.id,
             ),
         )
@@ -362,10 +362,10 @@ class BumpEngine:
         _, best_lots = candidates[0]
 
         return min(best_lots, key=lambda l: (
-            l.last_bumped_at is not None,
-            l.last_bumped_at or datetime.min,
             l.expires_at is None,
             l.expires_at or datetime.max,
+            l.last_bumped_at is not None,
+            l.last_bumped_at or datetime.min,
             l.id,
         ))
 
