@@ -3,7 +3,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import selectinload
 
 from database.db import Database
@@ -188,10 +188,17 @@ class BumpEngine:
                 if lot is not None:
                     result.append(lot)
 
-            # --- Независимые фильтры: глобальный раунд-робин ---
+            # --- Независимые фильтры + фильтры из выключенных циклов ---
             indep_q = await session.execute(
                 select(Filter)
-                .where(Filter.cycle_id.is_(None), Filter.enabled.is_(True))
+                .outerjoin(Filter.cycle)
+                .where(
+                    Filter.enabled.is_(True),
+                    or_(
+                        Filter.cycle_id.is_(None),
+                        Cycle.enabled.is_(False),
+                    ),
+                )
                 .options(selectinload(Filter.lots))
             )
             global_pick = self._pick_independent_global(indep_q.scalars().all(), now_utc)
@@ -221,12 +228,13 @@ class BumpEngine:
 
             def _lot_key(l: Lot):
                 on_cd = _elapsed(l) < flt.interval_minutes
+                # Priority: 1) not on cooldown  2) never bumped  3) oldest bump  4) soonest expiry
                 return (
                     on_cd,
-                    l.expires_at is None,
-                    l.expires_at or datetime.max,
                     l.last_bumped_at is not None,
                     l.last_bumped_at or datetime.min,
+                    l.expires_at is None,
+                    l.expires_at or datetime.max,
                     l.id,
                 )
 
@@ -303,12 +311,19 @@ class BumpEngine:
 
         lot = min(
             filter_lots,
-            key=lambda l: (l.expires_at is None, l.expires_at or datetime.max, l.id),
+            key=lambda l: (
+                l.last_bumped_at is not None,
+                l.last_bumped_at or datetime.min,
+                l.expires_at is None,
+                l.expires_at or datetime.max,
+                l.id,
+            ),
         )
         logger.info(
-            "CYCLE '%s' pos=%d — lot #%d expires=%s",
+            "CYCLE '%s' pos=%d — lot #%d last=%s expires=%s",
             cycle.name, pos_in_cycle, lot.id,
-            lot.expires_at.strftime("%Y-%m-%d %H:%M") if lot.expires_at else "unknown",
+            lot.last_bumped_at.strftime("%H:%M") if lot.last_bumped_at else "never",
+            lot.expires_at.strftime("%d.%m") if lot.expires_at else "?",
         )
         return lot
 
