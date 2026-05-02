@@ -366,7 +366,21 @@ class BumpEngine:
         try:
             await self.playerok.bump(lot.playerok_id, status_id)
         except Exception as exc:
-            await self._record_failure(lot.id, str(exc))
+            err = str(exc)
+            if any(p in err.lower() for p in self._SOLD_PHRASES):
+                logger.info("Lot #%d sold during bump — searching for re-listing", lot.id)
+                refreshed = await self._refresh_lot_id(lot)
+                async with self.db.session_factory() as session:
+                    db_lot = await session.get(Lot, lot.id)
+                    if db_lot:
+                        db_lot.last_bumped_at = datetime.utcnow()
+                        await session.commit()
+                if refreshed is None:
+                    logger.info("Lot #%d: no re-listing found yet — skipping tick", lot.id)
+                else:
+                    logger.info("Lot #%d refreshed to playerok_id=%s — will bump next tick", lot.id, refreshed.playerok_id)
+                return
+            await self._record_failure(lot.id, err)
             return
 
         await self._record_success(lot.id, cost)
