@@ -210,22 +210,23 @@ class BumpEngine:
                 logger.debug("SKIP filter '%s' (id=%d): budget exhausted", flt.name, flt.id)
                 continue
 
-            eligible: list[Lot] = []
-            for lot in flt.lots:
-                if lot.paused:
-                    continue
-                if lot.last_bumped_at is not None:
-                    elapsed_min = (now_utc - lot.last_bumped_at).total_seconds() / 60
-                    if elapsed_min < flt.interval_minutes:
-                        continue
-                eligible.append(lot)
+            all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at is not None]
+            filter_last_bump = max(all_bumped) if all_bumped else None
 
+            # Filter-level cooldown: the whole filter rests interval_minutes between bumps
+            if filter_last_bump is not None:
+                filter_elapsed = (now_utc - filter_last_bump).total_seconds() / 60
+                if filter_elapsed < flt.interval_minutes:
+                    logger.debug(
+                        "SKIP filter '%s' (id=%d): bumped %.1f min ago (interval=%d)",
+                        flt.name, flt.id, filter_elapsed, flt.interval_minutes,
+                    )
+                    continue
+
+            eligible = [l for l in flt.lots if not l.paused]
             if not eligible:
                 logger.debug("SKIP filter '%s' (id=%d): no eligible lots", flt.name, flt.id)
                 continue
-
-            all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at is not None]
-            filter_last_bump = max(all_bumped) if all_bumped else None
 
             eligible.sort(key=lambda l: (l.expires_at is None, l.expires_at or datetime.max, l.id))
             filter_candidates.append((filter_last_bump, flt, eligible))
