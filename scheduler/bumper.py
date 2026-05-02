@@ -195,7 +195,6 @@ class BumpEngine:
             [f for f in cycle.filters if f.enabled],
             key=lambda f: f.order_index,
         )
-        # Build per-filter lot lists (sorted by id for stable ordering)
         per_filter: list[list[Lot]] = []
         for flt in active_filters:
             if not self._filter_has_budget(flt):
@@ -207,28 +206,8 @@ class BumpEngine:
         if not per_filter:
             return None
 
-        # Interleave: F1[0]→F2[0]→F3[0]→F1[1]→F2[1]→...
-        # so different categories alternate instead of all of one category first
-        flat_lots: list[Lot] = []
-        i = 0
-        while True:
-            added = False
-            for lots in per_filter:
-                if i < len(lots):
-                    flat_lots.append(lots[i])
-                    added = True
-            if not added:
-                break
-            i += 1
+        schedule = self._build_cycle_schedule(per_filter, cycle.duration_minutes)
 
-        slot = self._current_slot(cycle, now, len(flat_lots))
-        if slot is None:
-            return None
-        return flat_lots[slot]
-
-    def _current_slot(
-        self, cycle: Cycle, now: datetime, total_slots: int
-    ) -> int | None:
         try:
             sh, sm = (int(p) for p in cycle.start_time.split(":"))
         except ValueError:
@@ -239,13 +218,44 @@ class BumpEngine:
         elapsed_min = int((now - start).total_seconds() // 60)
         pos_in_cycle = elapsed_min % cycle.duration_minutes
 
-        # Равномерно распределяем лоты по длительности цикла.
-        # Пример: 2 лота / 60 мин → поднятия на минутах 0 и 30.
-        interval = cycle.duration_minutes / total_slots
-        for i in range(total_slots):
-            if pos_in_cycle == round(i * interval):
-                return i
-        return None
+        return schedule.get(pos_in_cycle)
+
+    @staticmethod
+    def _build_cycle_schedule(
+        per_filter: list[list[Lot]], duration: int
+    ) -> dict[int, Lot]:
+        """
+        Proportional schedule: the filter with the most lots fires most often.
+        Example: 80r=12 lots → every 5 min; others=6 lots → every 10 min in a 60-min cycle.
+
+        Algorithm:
+        1. Primary (largest) filter occupies equally-spaced minutes.
+        2. Secondary filters fill remaining minutes round-robin.
+        """
+        # Most lots first → primary grid
+        sorted_filters = sorted(per_filter, key=lambda f: -len(f))
+        schedule: dict[int, Lot] = {}
+
+        primary = sorted_filters[0]
+        primary_n = len(primary)
+        primary_step = duration / primary_n
+        for k, lot in enumerate(primary):
+            m = round(k * primary_step) % duration
+            schedule[m] = lot
+
+        # Remaining minutes for secondary filters
+        available = [m for m in range(duration) if m not in schedule]
+        avail_idx = 0
+        secondaries = sorted_filters[1:]
+        if secondaries and available:
+            max_k = max(len(f) for f in secondaries)
+            for k in range(max_k):
+                for flt in secondaries:
+                    if k < len(flt) and avail_idx < len(available):
+                        schedule[available[avail_idx]] = flt[k]
+                        avail_idx += 1
+
+        return schedule
 
     @staticmethod
     def _filter_has_budget(flt: Filter) -> bool:
@@ -288,8 +298,12 @@ class BumpEngine:
             lot = await session.get(Lot, lot_id, options=[selectinload(Lot.filter)])
             if lot is None:
                 return
-            # Обновляем last_bumped_at чтобы сломанный лот не застревал в начале очереди
             lot.last_bumped_at = datetime.utcnow()
+            # Lot sold/deleted on Playerok — auto-pause so bot stops trying
+            if "нельзя обновить статус" in error or "не найден" in error.lower():
+                lot.paused = True
+                error = "автопауза: лот продан или удалён — добавь новый в фильтр"
+                logger.info("Auto-paused lot #%d: %s", lot_id, error)
             session.add(BumpHistory(lot_id=lot.id, success=False, error=error))
             await session.commit()
             await self.on_result(lot, False, 0, error)
