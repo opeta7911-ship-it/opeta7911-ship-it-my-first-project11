@@ -15,7 +15,7 @@ from bot.keyboards.menus import (
     lot_selection_menu,
     lots_per_trigger_menu,
 )
-from bot.states import FilterCreate, FilterEditIntervalCustom, FilterEditLimit
+from bot.states import FilterCreate, FilterEditIntervalCustom, FilterEditKeyword, FilterEditLimit
 from database.db import Database
 from database.models import Cycle, Filter, Lot
 from playerok.client import PlayerokClient
@@ -29,13 +29,16 @@ PAGE_SIZE = 8
 def _format_filter(flt: Filter) -> str:
     lines = [f"<b>Фильтр: {flt.name}</b>", ""]
     lines.append(f"Состояние: {'🟢 ВКЛ' if flt.enabled else '🔴 ВЫКЛ'}")
+    if flt.keyword:
+        lines.append(f"🔑 Ключевое слово: <code>{flt.keyword}</code>")
+        lines.append("  Бот сам находит лоты по этому слову и поднимает самый старый.")
     if flt.lots:
-        lines.append(f"Лотов: {len(flt.lots)}")
+        lines.append(f"Лотов в базе: {len(flt.lots)}")
         for lot in flt.lots:
             exp = f" · до {lot.expires_at.strftime('%d.%m')}" if lot.expires_at else ""
             lines.append(f'  • <a href="{lot.url}">{lot.name}</a> · {lot.price_kopecks // 100}₽{exp}')
-    else:
-        lines.append("Лотов: 0")
+    elif not flt.keyword:
+        lines.append("Лотов: 0 — добавь лоты или задай ключевое слово")
     if flt.cycle_id:
         lines.append("Поднимать: ✅ настроено циклом")
     elif flt.interval_minutes:
@@ -147,6 +150,38 @@ async def cb_filter_delete(call: CallbackQuery, db: Database) -> None:
             await session.delete(flt)
             await session.commit()
     await cb_filters(call, db)
+
+
+# ── Ключевое слово ─────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("filter_keyword:"))
+async def cb_filter_keyword(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    fid = int(call.data.split(":")[1])
+    await state.set_state(FilterEditKeyword.waiting_for_keyword)
+    await state.update_data(filter_id=fid)
+    await call.message.edit_text(
+        "Введи ключевое слово для поиска лотов на Playerok.\n\n"
+        "Бот будет каждую минуту искать все твои активные лоты, у которых это слово "
+        "есть в названии, и поднимать <b>самый старый</b> из них автоматически.\n\n"
+        "Пример: <code>352</code> или <code>88 Робуксов</code>\n\n"
+        "Отправь <code>0</code>, чтобы убрать ключевое слово:",
+        reply_markup=back_button(f"filter:{fid}"),
+    )
+
+
+@router.message(FilterEditKeyword.waiting_for_keyword)
+async def msg_filter_keyword(message: Message, state: FSMContext, db: Database) -> None:
+    kw = message.text.strip()
+    data = await state.get_data()
+    fid = data["filter_id"]
+    async with db.session_factory() as session:
+        flt = await session.get(Filter, fid)
+        if flt:
+            flt.keyword = None if kw == "0" else kw[:255]
+            await session.commit()
+    await state.clear()
+    await _send_filter_card(message, db, fid)
 
 
 # ── Выбор лотов из списка ──────────────────────────────────────────────────

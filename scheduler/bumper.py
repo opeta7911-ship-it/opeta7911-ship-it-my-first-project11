@@ -86,7 +86,7 @@ class BumpEngine:
         self._task = asyncio.create_task(self._run_loop())
 
     async def _startup_sync(self) -> None:
-        """On startup, sync all stored lots against currently active Playerok lots."""
+        """On startup, sync all stored lots (non-keyword) against currently active Playerok lots."""
         try:
             active = await self.playerok.get_my_lots()
         except Exception as e:
@@ -96,14 +96,17 @@ class BumpEngine:
         active_ids = {a.playerok_id for a in active}
 
         async with self.db.session_factory() as session:
-            result = await session.execute(select(Lot).where(Lot.paused.is_(False)))
+            result = await session.execute(
+                select(Lot)
+                .join(Lot.filter)
+                .where(Lot.paused.is_(False), Filter.keyword.is_(None))
+            )
             all_lots = result.scalars().all()
 
         active_by_id = {a.playerok_id: a for a in active}
         untracked = [a for a in active if a.playerok_id not in {l.playerok_id for l in all_lots}]
         updated = 0
 
-        # Refresh expires_at for lots already tracked and still active
         for lot in all_lots:
             a = active_by_id.get(lot.playerok_id)
             if a and a.expires_at is not None and a.expires_at != lot.expires_at:
@@ -170,36 +173,32 @@ class BumpEngine:
     async def _tick(self) -> None:
         now = datetime.now()
         now_utc = datetime.utcnow()
-        lots = await self._pick_next_lots(now, now_utc)
+
+        # Fetch live lots once per tick (needed for keyword-based filters)
+        live_lots: list[MyLot] = []
+        try:
+            live_lots = await self.playerok.get_my_lots()
+        except Exception as e:
+            logger.warning("get_my_lots failed this tick: %s", e)
+
+        lots = await self._pick_next_lots(now, now_utc, live_lots)
         if not lots:
             logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
         for lot in lots:
             await self._bump_lot(lot)
 
-    async def _pick_next_lots(self, now: datetime, now_utc: datetime) -> list[Lot]:
+    async def _pick_next_lots(self, now: datetime, now_utc: datetime, live_lots: list[MyLot]) -> list[Lot]:
         result: list[Lot] = []
+
+        # Load all data in one session, then close it before any writes
         async with self.db.session_factory() as session:
-            # --- Циклы (логика без изменений) ---
             cycles_q = await session.execute(
                 select(Cycle)
                 .where(Cycle.enabled.is_(True))
                 .options(selectinload(Cycle.filters).selectinload(Filter.lots))
             )
-            for cycle in cycles_q.scalars().all():
-                lot = self._pick_from_cycle(cycle, now)
-                if lot is None:
-                    # Empty schedule slot — round-robin fallback, skipping already-bumped filters
-                    bumped_filter_ids = {l.filter_id for l in result}
-                    lot = self._pick_cycle_fallback(cycle, now_utc, bumped_filter_ids)
-                    if lot is not None:
-                        logger.info(
-                            "CYCLE '%s' fallback — lot #%d (empty slot covered)",
-                            cycle.name, lot.id,
-                        )
-                if lot is not None:
-                    result.append(lot)
+            cycles = cycles_q.scalars().all()
 
-            # --- Независимые фильтры + фильтры из выключенных циклов ---
             indep_q = await session.execute(
                 select(Filter)
                 .outerjoin(Filter.cycle)
@@ -212,13 +211,29 @@ class BumpEngine:
                 )
                 .options(selectinload(Filter.lots))
             )
-            global_pick = self._pick_independent_global(indep_q.scalars().all(), now_utc)
-            result.extend(global_pick)
+            indep_filters = indep_q.scalars().all()
+
+        for cycle in cycles:
+            lot = await self._pick_from_cycle(cycle, now, live_lots)
+            if lot is None:
+                bumped_filter_ids = {l.filter_id for l in result}
+                lot = await self._pick_cycle_fallback(cycle, now_utc, live_lots, bumped_filter_ids)
+                if lot is not None:
+                    logger.info(
+                        "CYCLE '%s' fallback — lot #%d (empty slot covered)",
+                        cycle.name, lot.id,
+                    )
+            if lot is not None:
+                result.append(lot)
+
+        global_pick = await self._pick_independent_global(indep_filters, now_utc, live_lots)
+        result.extend(global_pick)
 
         return result
 
-    def _pick_independent_global(self, filters: list[Filter], now_utc: datetime) -> list[Lot]:
-        # Each entry: (filter_on_cooldown, filter_last_bump, flt, sorted_lots)
+    async def _pick_independent_global(
+        self, filters: list[Filter], now_utc: datetime, live_lots: list[MyLot]
+    ) -> list[Lot]:
         filter_candidates = []
 
         for flt in filters:
@@ -229,40 +244,54 @@ class BumpEngine:
                 logger.debug("SKIP filter '%s' (id=%d): budget exhausted", flt.name, flt.id)
                 continue
 
-            lots = [l for l in flt.lots if not l.paused]
-            if not lots:
-                logger.debug("SKIP filter '%s' (id=%d): no lots", flt.name, flt.id)
-                continue
-
-            def _elapsed(l: Lot) -> float:
-                return (now_utc - l.last_bumped_at).total_seconds() / 60 if l.last_bumped_at else float("inf")
-
-            def _lot_key(l: Lot):
-                on_cd = _elapsed(l) < flt.interval_minutes
-                # Priority: 1) not on cooldown  2) soonest expiry  3) oldest bump
-                return (
-                    on_cd,
+            if flt.keyword:
+                kw = flt.keyword.lower()
+                matches = [l for l in live_lots if kw in l.name.lower()]
+                if not matches:
+                    logger.debug("SKIP filter '%s' (id=%d): keyword '%s' no matches", flt.name, flt.id, flt.keyword)
+                    continue
+                # Pick oldest live lot
+                best_live = min(matches, key=lambda l: (
                     l.expires_at is None,
                     l.expires_at or datetime.max,
-                    l.last_bumped_at is not None,
-                    l.last_bumped_at or datetime.min,
-                    l.id,
-                )
+                    l.playerok_id,
+                ))
+                # Determine filter cooldown from DB lots' last_bumped_at
+                all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at]
+                filter_last_bump = max(all_bumped) if all_bumped else None
+                elapsed = (now_utc - filter_last_bump).total_seconds() / 60 if filter_last_bump else float("inf")
+                filter_on_cooldown = elapsed < flt.interval_minutes
+                filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, best_live, True))
+            else:
+                lots = [l for l in flt.lots if not l.paused]
+                if not lots:
+                    logger.debug("SKIP filter '%s' (id=%d): no lots", flt.name, flt.id)
+                    continue
 
-            lots.sort(key=_lot_key)
+                def _elapsed(l: Lot) -> float:
+                    return (now_utc - l.last_bumped_at).total_seconds() / 60 if l.last_bumped_at else float("inf")
 
-            all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
-            filter_last_bump = max(all_bumped) if all_bumped else None
-            # Filter is "on cooldown" when its best available lot is still within interval
-            filter_on_cooldown = _elapsed(lots[0]) < flt.interval_minutes
+                def _lot_key(l: Lot):
+                    on_cd = _elapsed(l) < flt.interval_minutes
+                    return (
+                        on_cd,
+                        l.expires_at is None,
+                        l.expires_at or datetime.max,
+                        l.last_bumped_at is not None,
+                        l.last_bumped_at or datetime.min,
+                        l.id,
+                    )
 
-            filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, lots))
+                lots.sort(key=_lot_key)
+                all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
+                filter_last_bump = max(all_bumped) if all_bumped else None
+                filter_on_cooldown = _elapsed(lots[0]) < flt.interval_minutes
+                filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, lots, False))
 
         if not filter_candidates:
             logger.debug("ROBIN: no candidates this tick")
             return []
 
-        # Non-cooldown filters first; among equal cooldown state, oldest filter_last_bump first
         filter_candidates.sort(
             key=lambda x: (x[0], x[1] is not None, x[1] or datetime.min, x[2].id)
         )
@@ -275,34 +304,40 @@ class BumpEngine:
             ),
         )
 
-        _, _, best_flt, best_lots = filter_candidates[0]
+        filter_on_cooldown, filter_last_bump, best_flt, data, is_keyword = filter_candidates[0]
         n = best_flt.lots_per_trigger or 1
-        logger.info("ROBIN selected: '%s' → %d lot(s)", best_flt.name, n)
-        return best_lots[:n]
+        logger.info("ROBIN selected: '%s' (keyword=%s) → %d lot(s)", best_flt.name, is_keyword, n)
 
-    def _pick_from_cycle(self, cycle: Cycle, now: datetime) -> Lot | None:
-        active_filters = sorted(
-            [f for f in cycle.filters if f.enabled],
-            key=lambda f: f.order_index,
-        )
-        per_filter: list[list[Lot]] = []
-        for flt in active_filters:
-            if not self._filter_has_budget(flt):
+        if is_keyword:
+            db_lot = await self._get_or_create_keyword_lot(best_flt.id, data)
+            return [db_lot] if db_lot else []
+        else:
+            return data[:n]
+
+    async def _pick_from_cycle(self, cycle: Cycle, now: datetime, live_lots: list[MyLot]) -> Lot | None:
+        # Build list of (filter, slot_count) for schedule
+        filter_slots: list[tuple[Filter, int]] = []
+        for flt in sorted(cycle.filters, key=lambda f: f.order_index):
+            if not flt.enabled or not self._filter_has_budget(flt):
                 continue
-            lots = [l for l in flt.lots if not l.paused]
-            if lots:
-                per_filter.append(lots)
+            if flt.keyword:
+                kw = flt.keyword.lower()
+                matches = [l for l in live_lots if kw in l.name.lower()]
+                n = len(matches) if matches else 0
+            else:
+                n = len([l for l in flt.lots if not l.paused])
+            if n > 0:
+                filter_slots.append((flt, n))
 
-        if not per_filter:
+        if not filter_slots:
             return None
 
-        # minute → all lots for the filter that fires at that minute
-        schedule = self._build_cycle_schedule(per_filter, cycle.duration_minutes)
-        total_lots = sum(len(f) for f in per_filter)
+        schedule = self._build_cycle_schedule(filter_slots, cycle.duration_minutes)
+        total_slots = sum(s for _, s in filter_slots)
         filled = len(schedule)
         logger.info(
             "CYCLE '%s': %d filters, %d lots, %d/%d min filled",
-            cycle.name, len(per_filter), total_lots, filled, cycle.duration_minutes,
+            cycle.name, len(filter_slots), total_slots, filled, cycle.duration_minutes,
         )
 
         try:
@@ -315,83 +350,178 @@ class BumpEngine:
         elapsed_min = int((now - start).total_seconds() // 60)
         pos_in_cycle = elapsed_min % cycle.duration_minutes
 
-        filter_lots = schedule.get(pos_in_cycle)
-        if not filter_lots:
+        scheduled_flt = schedule.get(pos_in_cycle)
+        if not scheduled_flt:
             logger.debug("CYCLE '%s' pos=%d — empty slot", cycle.name, pos_in_cycle)
             return None
 
-        lot = min(
-            filter_lots,
-            key=lambda l: (
+        if scheduled_flt.keyword:
+            kw = scheduled_flt.keyword.lower()
+            matches = [l for l in live_lots if kw in l.name.lower()]
+            if not matches:
+                logger.info(
+                    "CYCLE '%s' pos=%d — keyword '%s': no matches on Playerok",
+                    cycle.name, pos_in_cycle, scheduled_flt.keyword,
+                )
+                return None
+            best_live = min(matches, key=lambda l: (
+                l.expires_at is None,
+                l.expires_at or datetime.max,
+                l.playerok_id,
+            ))
+            logger.info(
+                "CYCLE '%s' pos=%d — keyword '%s' → '%s' expires=%s",
+                cycle.name, pos_in_cycle, scheduled_flt.keyword, best_live.name,
+                best_live.expires_at.strftime("%d.%m") if best_live.expires_at else "?",
+            )
+            return await self._get_or_create_keyword_lot(scheduled_flt.id, best_live)
+        else:
+            filter_lots = [l for l in scheduled_flt.lots if not l.paused]
+            if not filter_lots:
+                return None
+            lot = min(filter_lots, key=lambda l: (
                 l.expires_at is None,
                 l.expires_at or datetime.max,
                 l.last_bumped_at is not None,
                 l.last_bumped_at or datetime.min,
                 l.id,
-            ),
-        )
-        logger.info(
-            "CYCLE '%s' pos=%d — lot #%d last=%s expires=%s",
-            cycle.name, pos_in_cycle, lot.id,
-            lot.last_bumped_at.strftime("%H:%M") if lot.last_bumped_at else "never",
-            lot.expires_at.strftime("%d.%m") if lot.expires_at else "?",
-        )
-        return lot
+            ))
+            logger.info(
+                "CYCLE '%s' pos=%d — lot #%d last=%s expires=%s",
+                cycle.name, pos_in_cycle, lot.id,
+                lot.last_bumped_at.strftime("%H:%M") if lot.last_bumped_at else "never",
+                lot.expires_at.strftime("%d.%m") if lot.expires_at else "?",
+            )
+            return lot
 
-    def _pick_cycle_fallback(
-        self, cycle: Cycle, now_utc: datetime, exclude_filter_ids: set[int] | None = None
+    async def _pick_cycle_fallback(
+        self,
+        cycle: Cycle,
+        now_utc: datetime,
+        live_lots: list[MyLot],
+        exclude_filter_ids: set[int] | None = None,
     ) -> Lot | None:
         """Round-robin fallback for empty cycle slots — picks the filter bumped longest ago."""
-        candidates: list[tuple[datetime | None, list[Lot]]] = []
+        candidates = []
         for flt in cycle.filters:
             if not flt.enabled or not self._filter_has_budget(flt):
                 continue
             if exclude_filter_ids and flt.id in exclude_filter_ids:
                 continue
-            lots = [l for l in flt.lots if not l.paused]
-            if not lots:
-                continue
-            all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
-            filter_last_bump = max(all_bumped) if all_bumped else None
-            candidates.append((filter_last_bump, lots))
+
+            if flt.keyword:
+                kw = flt.keyword.lower()
+                matches = [l for l in live_lots if kw in l.name.lower()]
+                if not matches:
+                    continue
+                all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at]
+                filter_last_bump = max(all_bumped) if all_bumped else None
+                candidates.append((filter_last_bump, flt, matches, True))
+            else:
+                lots = [l for l in flt.lots if not l.paused]
+                if not lots:
+                    continue
+                all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
+                filter_last_bump = max(all_bumped) if all_bumped else None
+                candidates.append((filter_last_bump, flt, lots, False))
 
         if not candidates:
             return None
 
         candidates.sort(key=lambda x: (x[0] is not None, x[0] or datetime.min))
-        _, best_lots = candidates[0]
+        filter_last_bump, best_flt, data, is_keyword = candidates[0]
 
-        return min(best_lots, key=lambda l: (
-            l.expires_at is None,
-            l.expires_at or datetime.max,
-            l.last_bumped_at is not None,
-            l.last_bumped_at or datetime.min,
-            l.id,
-        ))
+        if is_keyword:
+            best_live = min(data, key=lambda l: (
+                l.expires_at is None,
+                l.expires_at or datetime.max,
+                l.playerok_id,
+            ))
+            return await self._get_or_create_keyword_lot(best_flt.id, best_live)
+        else:
+            return min(data, key=lambda l: (
+                l.expires_at is None,
+                l.expires_at or datetime.max,
+                l.last_bumped_at is not None,
+                l.last_bumped_at or datetime.min,
+                l.id,
+            ))
 
     @staticmethod
     def _build_cycle_schedule(
-        per_filter: list[list[Lot]], duration: int
-    ) -> dict[int, list[Lot]]:
+        filter_slots: list[tuple[Filter, int]], duration: int
+    ) -> dict[int, Filter]:
         """
-        Assigns each filter a set of evenly-spaced minutes using greedy offset search.
+        Assigns each filter a set of evenly-spaced minutes.
+        Returns dict: minute_pos -> Filter.
         Filters with more lots fire more often and claim slots first.
         No two filters ever share the same minute.
         """
-        sorted_filters = sorted(per_filter, key=lambda f: -len(f))
-        schedule: dict[int, list[Lot]] = {}
+        sorted_items = sorted(filter_slots, key=lambda x: -x[1])
+        schedule: dict[int, Filter] = {}
 
-        for flt_lots in sorted_filters:
-            n = min(len(flt_lots), duration)
+        for flt, n in sorted_items:
+            n = min(n, duration)
             step = duration / n
             for offset in range(duration):
                 positions = [round(offset + k * step) % duration for k in range(n)]
                 if len(set(positions)) == n and all(p not in schedule for p in positions):
                     for p in positions:
-                        schedule[p] = flt_lots
+                        schedule[p] = flt
                     break
 
         return schedule
+
+    async def _get_or_create_keyword_lot(self, filter_id: int, live: MyLot) -> Lot | None:
+        """Find or create a DB Lot record for a keyword-matched live lot."""
+        async with self.db.session_factory() as session:
+            # Try by playerok_id (exact match — most common case after first bump)
+            result = await session.execute(
+                select(Lot).where(Lot.playerok_id == live.playerok_id)
+            )
+            db_lot = result.scalar_one_or_none()
+            if db_lot:
+                db_lot.filter_id = filter_id
+                db_lot.expires_at = live.expires_at
+                db_lot.price_kopecks = live.price_kopecks
+                db_lot.name = live.name
+                db_lot.paused = False
+                await session.commit()
+                return db_lot
+
+            # Create new record
+            try:
+                db_lot = Lot(
+                    filter_id=filter_id,
+                    playerok_id=live.playerok_id,
+                    url=live.url,
+                    name=live.name,
+                    price_kopecks=live.price_kopecks,
+                    bump_cost_kopecks=0,
+                    expires_at=live.expires_at,
+                )
+                session.add(db_lot)
+                await session.commit()
+                await session.refresh(db_lot)
+                return db_lot
+            except Exception as e:
+                await session.rollback()
+                logger.warning("_get_or_create_keyword_lot create failed: %s", e)
+                # Unique URL constraint — find by URL
+                try:
+                    result2 = await session.execute(select(Lot).where(Lot.url == live.url))
+                    existing = result2.scalar_one_or_none()
+                    if existing:
+                        existing.filter_id = filter_id
+                        existing.playerok_id = live.playerok_id
+                        existing.expires_at = live.expires_at
+                        existing.price_kopecks = live.price_kopecks
+                        existing.paused = False
+                        await session.commit()
+                        return existing
+                except Exception:
+                    pass
+                return None
 
     @staticmethod
     def _filter_has_budget(flt: Filter) -> bool:
@@ -411,7 +541,6 @@ class BumpEngine:
             if any(p in err.lower() for p in self._SOLD_PHRASES):
                 refreshed = await self._refresh_lot_id(lot)
                 if refreshed is None:
-                    # Re-listing bot may not have re-listed yet — skip this tick silently
                     logger.info("Lot #%d sold, no re-listing found yet — skipping tick", lot.id)
                     async with self.db.session_factory() as session:
                         db_lot = await session.get(Lot, lot.id)
@@ -462,10 +591,8 @@ class BumpEngine:
         if not candidates:
             return None
         norm = BumpEngine._normalize(lot.name)
-        # 1. Exact normalized name
         by_name = [c for c in candidates if BumpEngine._normalize(c.name) == norm]
         pool = by_name if by_name else candidates
-        # 2. Closest price within 10%
         within_price = [c for c in pool if abs(c.price_kopecks - lot.price_kopecks) <= lot.price_kopecks * 0.1]
         if within_price:
             return min(within_price, key=lambda c: abs(c.price_kopecks - lot.price_kopecks))

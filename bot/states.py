@@ -25,3 +25,7 @@ class CycleEditStart(StatesGroup):
 
 class CycleEditDuration(StatesGroup):
     waiting_for_minutes = State()
+
+
+class FilterEditKeyword(StatesGroup):
+    waiting_for_keyword = State()
