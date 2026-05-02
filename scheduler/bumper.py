@@ -141,15 +141,14 @@ class BumpEngine:
         return result
 
     def _pick_independent_global(self, filters: list[Filter], now_utc: datetime) -> list[Lot]:
-        """
-        Глобальный раунд-робин между фильтрами.
-        Каждый тик выбирается фильтр, который ДОЛЬШЕ ВСЕХ не поднимал ни одного лота,
-        из него берётся лот с наибольшим временем ожидания.
-        """
         filter_candidates: list[tuple[datetime | None, Filter, list[Lot]]] = []
 
         for flt in filters:
-            if not flt.interval_minutes or not self._filter_has_budget(flt):
+            if not flt.interval_minutes:
+                logger.debug("SKIP filter '%s' (id=%d): interval not set", flt.name, flt.id)
+                continue
+            if not self._filter_has_budget(flt):
+                logger.debug("SKIP filter '%s' (id=%d): budget exhausted", flt.name, flt.id)
                 continue
 
             eligible: list[Lot] = []
@@ -163,26 +162,32 @@ class BumpEngine:
                 eligible.append(lot)
 
             if not eligible:
+                logger.debug("SKIP filter '%s' (id=%d): no eligible lots", flt.name, flt.id)
                 continue
 
-            # Возраст фильтра = когда он ПОСЛЕДНИЙ РАЗ поднимал ЛЮБОЙ лот.
-            # Фильтр с None (никогда не поднимал) → высший приоритет.
-            # Фильтр, который поднимал давнее всех → следующий.
             all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at is not None]
             filter_last_bump = max(all_bumped) if all_bumped else None
 
-            # Внутри фильтра сортируем лоты по времени ожидания (старые — первые)
             eligible.sort(key=lambda l: (l.last_bumped_at is not None, l.last_bumped_at or datetime.min, l.id))
             filter_candidates.append((filter_last_bump, flt, eligible))
 
         if not filter_candidates:
+            logger.debug("ROBIN: no candidates this tick")
             return []
 
-        # Фильтры без единого поднятия — первыми, затем по времени последнего поднятия ASC
         filter_candidates.sort(key=lambda x: (x[0] is not None, x[0] or datetime.min, x[1].id))
+
+        logger.info(
+            "ROBIN candidates: %s",
+            ", ".join(
+                f"'{c[1].name}'(last={c[0].strftime('%H:%M:%S') if c[0] else 'never'})"
+                for c in filter_candidates
+            ),
+        )
 
         _, best_flt, best_lots = filter_candidates[0]
         n = best_flt.lots_per_trigger or 1
+        logger.info("ROBIN selected: '%s' → %d lot(s)", best_flt.name, n)
         return best_lots[:n]
 
     def _pick_from_cycle(self, cycle: Cycle, now: datetime) -> Lot | None:
