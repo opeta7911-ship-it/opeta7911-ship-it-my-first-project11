@@ -82,7 +82,47 @@ class BumpEngine:
         if self._task and not self._task.done():
             return
         self._enabled = True
+        asyncio.create_task(self._startup_sync())
         self._task = asyncio.create_task(self._run_loop())
+
+    async def _startup_sync(self) -> None:
+        """On startup, sync all stored lots against currently active Playerok lots."""
+        try:
+            active = await self.playerok.get_my_lots()
+        except Exception as e:
+            logger.warning("Startup sync: get_my_lots failed: %s", e)
+            return
+
+        active_ids = {a.playerok_id for a in active}
+
+        async with self.db.session_factory() as session:
+            result = await session.execute(select(Lot).where(Lot.paused.is_(False)))
+            all_lots = result.scalars().all()
+
+        untracked = [a for a in active if a.playerok_id not in {l.playerok_id for l in all_lots}]
+        updated = 0
+        for lot in all_lots:
+            if lot.playerok_id in active_ids:
+                continue
+            match = self._find_match(lot, untracked)
+            if match:
+                try:
+                    async with self.db.session_factory() as session:
+                        db_lot = await session.get(Lot, lot.id)
+                        if db_lot:
+                            db_lot.playerok_id = match.playerok_id
+                            db_lot.url = match.url
+                            db_lot.price_kopecks = match.price_kopecks
+                            await session.commit()
+                    untracked = [a for a in untracked if a.playerok_id != match.playerok_id]
+                    updated += 1
+                    logger.info("Startup sync: lot #%d → new playerok_id=%s", lot.id, match.playerok_id)
+                except Exception as e:
+                    logger.warning("Startup sync: failed to update lot #%d: %s", lot.id, e)
+            else:
+                logger.info("Startup sync: lot #%d not in active lots (sold, not yet re-listed)", lot.id)
+        if updated:
+            logger.info("Startup sync complete: %d lot(s) updated", updated)
 
     async def stop(self) -> None:
         self._enabled = False
@@ -269,7 +309,17 @@ class BumpEngine:
         except Exception as exc:
             err = str(exc)
             if any(p in err.lower() for p in self._SOLD_PHRASES):
-                lot = await self._refresh_lot_id(lot) or lot
+                refreshed = await self._refresh_lot_id(lot)
+                if refreshed is None:
+                    # Re-listing bot may not have re-listed yet — skip this tick silently
+                    logger.info("Lot #%d sold, no re-listing found yet — skipping tick", lot.id)
+                    async with self.db.session_factory() as session:
+                        db_lot = await session.get(Lot, lot.id)
+                        if db_lot:
+                            db_lot.last_bumped_at = datetime.utcnow()
+                            await session.commit()
+                    return
+                lot = refreshed
                 try:
                     cost, status_id = await self.playerok.refresh_bump_cost(
                         lot.playerok_id, lot.price_kopecks / 100
@@ -289,43 +339,65 @@ class BumpEngine:
 
         await self._record_success(lot.id, cost)
 
+    @staticmethod
+    def _normalize(s: str) -> str:
+        return " ".join(s.strip().lower().split())
+
+    @staticmethod
+    def _find_match(lot: Lot, candidates: list[MyLot]) -> "MyLot | None":
+        if not candidates:
+            return None
+        norm = BumpEngine._normalize(lot.name)
+        # 1. Exact normalized name
+        by_name = [c for c in candidates if BumpEngine._normalize(c.name) == norm]
+        pool = by_name if by_name else candidates
+        # 2. Closest price within 10%
+        within_price = [c for c in pool if abs(c.price_kopecks - lot.price_kopecks) <= lot.price_kopecks * 0.1]
+        if within_price:
+            return min(within_price, key=lambda c: abs(c.price_kopecks - lot.price_kopecks))
+        if by_name:
+            return min(by_name, key=lambda c: abs(c.price_kopecks - lot.price_kopecks))
+        return None
+
     async def _refresh_lot_id(self, lot: Lot) -> Lot | None:
-        """Find a re-listed version of a sold lot by name and update the DB."""
+        """Find a re-listed version of a sold lot and update the DB."""
         try:
             active = await self.playerok.get_my_lots()
-        except Exception:
+        except Exception as e:
+            logger.warning("get_my_lots failed for lot #%d: %s", lot.id, e)
             return None
 
-        # Exclude playerok_ids already tracked in our DB
         async with self.db.session_factory() as session:
             rows = await session.execute(select(Lot.playerok_id))
             tracked = {r[0] for r in rows}
 
-        candidates: list[MyLot] = [
-            a for a in active
-            if a.name == lot.name and a.playerok_id not in tracked
-        ]
-        if not candidates:
+        untracked = [a for a in active if a.playerok_id not in tracked]
+        logger.info(
+            "Lot #%d refresh: name='%s' price=%d — %d untracked candidates from %d active",
+            lot.id, lot.name, lot.price_kopecks, len(untracked), len(active),
+        )
+
+        match = self._find_match(lot, untracked)
+        if not match:
             return None
 
-        best = min(candidates, key=lambda a: abs(a.price_kopecks - lot.price_kopecks))
+        try:
+            async with self.db.session_factory() as session:
+                db_lot = await session.get(Lot, lot.id)
+                if db_lot is None:
+                    return None
+                db_lot.playerok_id = match.playerok_id
+                db_lot.url = match.url
+                db_lot.price_kopecks = match.price_kopecks
+                await session.commit()
+        except Exception as e:
+            logger.warning("Failed to update lot #%d in DB: %s", lot.id, e)
+            return None
 
-        async with self.db.session_factory() as session:
-            db_lot = await session.get(Lot, lot.id)
-            if db_lot is None:
-                return None
-            db_lot.playerok_id = best.playerok_id
-            db_lot.url = best.url
-            db_lot.price_kopecks = best.price_kopecks
-            await session.commit()
-
-        logger.info(
-            "Lot #%d re-listed: updated playerok_id=%s url=%s",
-            lot.id, best.playerok_id, best.url,
-        )
-        lot.playerok_id = best.playerok_id
-        lot.url = best.url
-        lot.price_kopecks = best.price_kopecks
+        logger.info("Lot #%d refreshed: %s → %s", lot.id, lot.playerok_id, match.playerok_id)
+        lot.playerok_id = match.playerok_id
+        lot.url = match.url
+        lot.price_kopecks = match.price_kopecks
         return lot
 
     async def _record_success(self, lot_id: int, cost_kopecks: int) -> None:
@@ -347,11 +419,6 @@ class BumpEngine:
             if lot is None:
                 return
             lot.last_bumped_at = datetime.utcnow()
-            # If we get here with a sold-lot error it means _refresh_lot_id also failed
-            if any(p in error.lower() for p in self._SOLD_PHRASES):
-                lot.paused = True
-                error = "автопауза: лот продан, новый не найден — обнови вручную"
-                logger.info("Auto-paused lot #%d (no re-listing found)", lot_id)
             session.add(BumpHistory(lot_id=lot.id, success=False, error=error))
             await session.commit()
             await self.on_result(lot, False, 0, error)
