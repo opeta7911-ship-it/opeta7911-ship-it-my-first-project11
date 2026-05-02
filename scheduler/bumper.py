@@ -8,7 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from database.db import Database
 from database.models import BumpHistory, Cycle, Filter, Lot
-from playerok.client import PlayerokClient
+from playerok.client import MyLot, PlayerokClient
 
 logger = logging.getLogger(__name__)
 
@@ -199,13 +199,14 @@ class BumpEngine:
         for flt in active_filters:
             if not self._filter_has_budget(flt):
                 continue
-            lots = sorted([l for l in flt.lots if not l.paused], key=lambda l: l.id)
+            lots = [l for l in flt.lots if not l.paused]
             if lots:
                 per_filter.append(lots)
 
         if not per_filter:
             return None
 
+        # minute → all lots for the filter that fires at that minute
         schedule = self._build_cycle_schedule(per_filter, cycle.duration_minutes)
 
         try:
@@ -218,32 +219,37 @@ class BumpEngine:
         elapsed_min = int((now - start).total_seconds() // 60)
         pos_in_cycle = elapsed_min % cycle.duration_minutes
 
-        return schedule.get(pos_in_cycle)
+        filter_lots = schedule.get(pos_in_cycle)
+        if not filter_lots:
+            return None
+
+        # Pick the lot in this filter that was bumped the longest ago
+        return min(
+            filter_lots,
+            key=lambda l: (l.last_bumped_at is not None, l.last_bumped_at or datetime.min, l.id),
+        )
 
     @staticmethod
     def _build_cycle_schedule(
         per_filter: list[list[Lot]], duration: int
-    ) -> dict[int, Lot]:
+    ) -> dict[int, list[Lot]]:
         """
-        Proportional schedule: the filter with the most lots fires most often.
-        Example: 80r=12 lots → every 5 min; others=6 lots → every 10 min in a 60-min cycle.
+        Maps each minute in [0, duration) to a filter's lot list.
+        The filter with the most lots fires most often (primary grid).
+        Secondary filters fill remaining minutes round-robin.
 
-        Algorithm:
-        1. Primary (largest) filter occupies equally-spaced minutes.
-        2. Secondary filters fill remaining minutes round-robin.
+        At each minute the caller picks the OLDEST lot from that filter's list,
+        so the specific lot chosen adapts to what has actually been bumped.
         """
-        # Most lots first → primary grid
         sorted_filters = sorted(per_filter, key=lambda f: -len(f))
-        schedule: dict[int, Lot] = {}
+        schedule: dict[int, list[Lot]] = {}
 
         primary = sorted_filters[0]
-        primary_n = len(primary)
-        primary_step = duration / primary_n
-        for k, lot in enumerate(primary):
+        primary_step = duration / len(primary)
+        for k in range(len(primary)):
             m = round(k * primary_step) % duration
-            schedule[m] = lot
+            schedule[m] = primary
 
-        # Remaining minutes for secondary filters
         available = [m for m in range(duration) if m not in schedule]
         avail_idx = 0
         secondaries = sorted_filters[1:]
@@ -252,7 +258,7 @@ class BumpEngine:
             for k in range(max_k):
                 for flt in secondaries:
                     if k < len(flt) and avail_idx < len(available):
-                        schedule[available[avail_idx]] = flt[k]
+                        schedule[available[avail_idx]] = flt
                         avail_idx += 1
 
         return schedule
@@ -263,14 +269,27 @@ class BumpEngine:
             return True
         return flt.spent_kopecks < flt.spend_limit_kopecks
 
+    _SOLD_PHRASES = ("нельзя обновить статус", "item not found", "не найден")
+
     async def _bump_lot(self, lot: Lot) -> None:
         try:
             cost, status_id = await self.playerok.refresh_bump_cost(
                 lot.playerok_id, lot.price_kopecks / 100
             )
         except Exception as exc:
-            await self._record_failure(lot.id, f"Не удалось получить цену поднятия: {exc}")
-            return
+            err = str(exc)
+            if any(p in err.lower() for p in self._SOLD_PHRASES):
+                lot = await self._refresh_lot_id(lot) or lot
+                try:
+                    cost, status_id = await self.playerok.refresh_bump_cost(
+                        lot.playerok_id, lot.price_kopecks / 100
+                    )
+                except Exception as exc2:
+                    await self._record_failure(lot.id, str(exc2))
+                    return
+            else:
+                await self._record_failure(lot.id, f"Не удалось получить цену поднятия: {exc}")
+                return
 
         try:
             await self.playerok.bump(lot.playerok_id, status_id)
@@ -279,6 +298,45 @@ class BumpEngine:
             return
 
         await self._record_success(lot.id, cost)
+
+    async def _refresh_lot_id(self, lot: Lot) -> Lot | None:
+        """Find a re-listed version of a sold lot by name and update the DB."""
+        try:
+            active = await self.playerok.get_my_lots()
+        except Exception:
+            return None
+
+        # Exclude playerok_ids already tracked in our DB
+        async with self.db.session_factory() as session:
+            rows = await session.execute(select(Lot.playerok_id))
+            tracked = {r[0] for r in rows}
+
+        candidates: list[MyLot] = [
+            a for a in active
+            if a.name == lot.name and a.playerok_id not in tracked
+        ]
+        if not candidates:
+            return None
+
+        best = min(candidates, key=lambda a: abs(a.price_kopecks - lot.price_kopecks))
+
+        async with self.db.session_factory() as session:
+            db_lot = await session.get(Lot, lot.id)
+            if db_lot is None:
+                return None
+            db_lot.playerok_id = best.playerok_id
+            db_lot.url = best.url
+            db_lot.price_kopecks = best.price_kopecks
+            await session.commit()
+
+        logger.info(
+            "Lot #%d re-listed: updated playerok_id=%s url=%s",
+            lot.id, best.playerok_id, best.url,
+        )
+        lot.playerok_id = best.playerok_id
+        lot.url = best.url
+        lot.price_kopecks = best.price_kopecks
+        return lot
 
     async def _record_success(self, lot_id: int, cost_kopecks: int) -> None:
         async with self.db.session_factory() as session:
@@ -299,11 +357,11 @@ class BumpEngine:
             if lot is None:
                 return
             lot.last_bumped_at = datetime.utcnow()
-            # Lot sold/deleted on Playerok — auto-pause so bot stops trying
-            if "нельзя обновить статус" in error or "не найден" in error.lower():
+            # If we get here with a sold-lot error it means _refresh_lot_id also failed
+            if any(p in error.lower() for p in self._SOLD_PHRASES):
                 lot.paused = True
-                error = "автопауза: лот продан или удалён — добавь новый в фильтр"
-                logger.info("Auto-paused lot #%d: %s", lot_id, error)
+                error = "автопауза: лот продан, новый не найден — обнови вручную"
+                logger.info("Auto-paused lot #%d (no re-listing found)", lot_id)
             session.add(BumpHistory(lot_id=lot.id, success=False, error=error))
             await session.commit()
             await self.on_result(lot, False, 0, error)
