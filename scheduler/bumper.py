@@ -99,8 +99,23 @@ class BumpEngine:
             result = await session.execute(select(Lot).where(Lot.paused.is_(False)))
             all_lots = result.scalars().all()
 
+        active_by_id = {a.playerok_id: a for a in active}
         untracked = [a for a in active if a.playerok_id not in {l.playerok_id for l in all_lots}]
         updated = 0
+
+        # Refresh expires_at for lots already tracked and still active
+        for lot in all_lots:
+            a = active_by_id.get(lot.playerok_id)
+            if a and a.expires_at is not None and a.expires_at != lot.expires_at:
+                try:
+                    async with self.db.session_factory() as session:
+                        db_lot = await session.get(Lot, lot.id)
+                        if db_lot:
+                            db_lot.expires_at = a.expires_at
+                            await session.commit()
+                except Exception as e:
+                    logger.warning("Startup sync: failed to refresh expires_at for lot #%d: %s", lot.id, e)
+
         for lot in all_lots:
             if lot.playerok_id in active_ids:
                 continue
@@ -113,6 +128,8 @@ class BumpEngine:
                             db_lot.playerok_id = match.playerok_id
                             db_lot.url = match.url
                             db_lot.price_kopecks = match.price_kopecks
+                            if match.expires_at is not None:
+                                db_lot.expires_at = match.expires_at
                             await session.commit()
                     untracked = [a for a in untracked if a.playerok_id != match.playerok_id]
                     updated += 1
@@ -210,7 +227,7 @@ class BumpEngine:
             all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at is not None]
             filter_last_bump = max(all_bumped) if all_bumped else None
 
-            eligible.sort(key=lambda l: (l.last_bumped_at is not None, l.last_bumped_at or datetime.min, l.id))
+            eligible.sort(key=lambda l: (l.expires_at is None, l.expires_at or datetime.max, l.id))
             filter_candidates.append((filter_last_bump, flt, eligible))
 
         if not filter_candidates:
@@ -274,12 +291,12 @@ class BumpEngine:
 
         lot = min(
             filter_lots,
-            key=lambda l: (l.last_bumped_at is not None, l.last_bumped_at or datetime.min, l.id),
+            key=lambda l: (l.expires_at is None, l.expires_at or datetime.max, l.id),
         )
         logger.info(
-            "CYCLE '%s' pos=%d — lot #%d last_bumped=%s",
+            "CYCLE '%s' pos=%d — lot #%d expires=%s",
             cycle.name, pos_in_cycle, lot.id,
-            lot.last_bumped_at.strftime("%H:%M") if lot.last_bumped_at else "never",
+            lot.expires_at.strftime("%Y-%m-%d %H:%M") if lot.expires_at else "unknown",
         )
         return lot
 
@@ -403,6 +420,8 @@ class BumpEngine:
                 db_lot.playerok_id = match.playerok_id
                 db_lot.url = match.url
                 db_lot.price_kopecks = match.price_kopecks
+                if match.expires_at is not None:
+                    db_lot.expires_at = match.expires_at
                 await session.commit()
         except Exception as e:
             logger.warning("Failed to update lot #%d in DB: %s", lot.id, e)
@@ -412,6 +431,8 @@ class BumpEngine:
         lot.playerok_id = match.playerok_id
         lot.url = match.url
         lot.price_kopecks = match.price_kopecks
+        if match.expires_at is not None:
+            lot.expires_at = match.expires_at
         return lot
 
     async def _record_success(self, lot_id: int, cost_kopecks: int) -> None:

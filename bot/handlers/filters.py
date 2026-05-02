@@ -32,7 +32,8 @@ def _format_filter(flt: Filter) -> str:
     if flt.lots:
         lines.append(f"Лотов: {len(flt.lots)}")
         for lot in flt.lots:
-            lines.append(f'  • <a href="{lot.url}">{lot.name}</a> · {lot.price_kopecks // 100}₽')
+            exp = f" · до {lot.expires_at.strftime('%d.%m')}" if lot.expires_at else ""
+            lines.append(f'  • <a href="{lot.url}">{lot.name}</a> · {lot.price_kopecks // 100}₽{exp}')
     else:
         lines.append("Лотов: 0")
     if flt.cycle_id:
@@ -205,6 +206,7 @@ async def cb_filter_lots_fetch(
                     "slug": l.slug,
                     "name": l.name,
                     "price_kopecks": l.price_kopecks,
+                    "expires_at": l.expires_at.isoformat() if l.expires_at else None,
                 }
                 for l in all_lots
             ]
@@ -254,7 +256,10 @@ async def cb_lot_toggle(
         else:
             lot_info = next((l for l in cached if l["playerok_id"] == playerok_id), None)
             if lot_info:
+                from datetime import datetime as _dt
                 from playerok.client import BASE_URL
+                raw_exp = lot_info.get("expires_at")
+                expires = _dt.fromisoformat(raw_exp) if raw_exp else None
                 # bump_cost сохраняем 0 — планировщик обновит цену прямо перед поднятием
                 session.add(Lot(
                     filter_id=fid,
@@ -263,6 +268,7 @@ async def cb_lot_toggle(
                     name=lot_info["name"],
                     price_kopecks=lot_info["price_kopecks"],
                     bump_cost_kopecks=0,
+                    expires_at=expires,
                 ))
         await session.commit()
         await session.refresh(flt, ["lots"])

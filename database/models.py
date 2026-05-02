@@ -57,6 +57,7 @@ class Lot(Base):
     price_kopecks: Mapped[int] = mapped_column(Integer)
     bump_cost_kopecks: Mapped[int] = mapped_column(Integer)
 
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     paused: Mapped[bool] = mapped_column(Boolean, default=False)
     last_bumped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

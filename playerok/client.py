@@ -1,6 +1,7 @@
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from playerokapi.account import Account
 from playerokapi.enums import ItemStatuses
@@ -8,11 +9,27 @@ from playerokapi.enums import ItemStatuses
 
 PLAYEROK_URL_RE = re.compile(r"playerok\.com/products/([^/?#\s]+)", re.IGNORECASE)
 BASE_URL = "https://playerok.com/products/"
+LOT_LIFETIME_DAYS = 30
 
 
 def extract_slug(url: str) -> str | None:
     m = PLAYEROK_URL_RE.search(url.strip())
     return m.group(1) if m else None
+
+
+def _parse_dt(s: str | None) -> datetime | None:
+    """Parse ISO-8601 datetime string to naive UTC datetime."""
+    if not s:
+        return None
+    try:
+        # Replace Z with +00:00 for fromisoformat compatibility
+        s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
 
 
 @dataclass
@@ -23,6 +40,7 @@ class MyLot:
     price_kopecks: int
     bump_cost_kopecks: int
     bump_priority_status_id: str
+    expires_at: datetime | None = None
 
     @property
     def url(self) -> str:
@@ -74,17 +92,20 @@ class PlayerokClient:
             account = await self._ensure_account()
             raw_items = await asyncio.to_thread(self._fetch_all_my_lots_sync, account)
 
-        return [
-            MyLot(
+        lots = []
+        for item in raw_items:
+            approval_dt = _parse_dt(getattr(item, "approval_date", None))
+            expires = (approval_dt + timedelta(days=LOT_LIFETIME_DAYS)) if approval_dt else None
+            lots.append(MyLot(
                 playerok_id=item.id,
                 slug=item.slug,
                 name=item.name,
                 price_kopecks=int(item.price * 100),
                 bump_cost_kopecks=0,
                 bump_priority_status_id="",
-            )
-            for item in raw_items
-        ]
+                expires_at=expires,
+            ))
+        return lots
 
     async def get_lot_bump_cost(self, playerok_id: str, price_rub: float) -> tuple[int, str]:
         """Запрашивает актуальную стоимость поднятия для конкретного лота."""
