@@ -195,15 +195,31 @@ class BumpEngine:
             [f for f in cycle.filters if f.enabled],
             key=lambda f: f.order_index,
         )
-        flat_lots: list[Lot] = []
+        # Build per-filter lot lists (sorted by id for stable ordering)
+        per_filter: list[list[Lot]] = []
         for flt in active_filters:
             if not self._filter_has_budget(flt):
                 continue
-            for lot in flt.lots:
-                if not lot.paused:
-                    flat_lots.append(lot)
-        if not flat_lots:
+            lots = sorted([l for l in flt.lots if not l.paused], key=lambda l: l.id)
+            if lots:
+                per_filter.append(lots)
+
+        if not per_filter:
             return None
+
+        # Interleave: F1[0]→F2[0]→F3[0]→F1[1]→F2[1]→...
+        # so different categories alternate instead of all of one category first
+        flat_lots: list[Lot] = []
+        i = 0
+        while True:
+            added = False
+            for lots in per_filter:
+                if i < len(lots):
+                    flat_lots.append(lots[i])
+                    added = True
+            if not added:
+                break
+            i += 1
 
         slot = self._current_slot(cycle, now, len(flat_lots))
         if slot is None:
