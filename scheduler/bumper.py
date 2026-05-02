@@ -185,6 +185,14 @@ class BumpEngine:
             )
             for cycle in cycles_q.scalars().all():
                 lot = self._pick_from_cycle(cycle, now)
+                if lot is None:
+                    # Empty schedule slot — round-robin fallback across cycle filters
+                    lot = self._pick_cycle_fallback(cycle, now_utc)
+                    if lot is not None:
+                        logger.info(
+                            "CYCLE '%s' fallback — lot #%d (empty slot covered)",
+                            cycle.name, lot.id,
+                        )
                 if lot is not None:
                     result.append(lot)
 
@@ -326,6 +334,33 @@ class BumpEngine:
             lot.expires_at.strftime("%d.%m") if lot.expires_at else "?",
         )
         return lot
+
+    def _pick_cycle_fallback(self, cycle: Cycle, now_utc: datetime) -> Lot | None:
+        """Round-robin fallback for empty cycle slots — picks the filter bumped longest ago."""
+        candidates: list[tuple[datetime | None, list[Lot]]] = []
+        for flt in cycle.filters:
+            if not flt.enabled or not self._filter_has_budget(flt):
+                continue
+            lots = [l for l in flt.lots if not l.paused]
+            if not lots:
+                continue
+            all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
+            filter_last_bump = max(all_bumped) if all_bumped else None
+            candidates.append((filter_last_bump, lots))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: (x[0] is not None, x[0] or datetime.min))
+        _, best_lots = candidates[0]
+
+        return min(best_lots, key=lambda l: (
+            l.last_bumped_at is not None,
+            l.last_bumped_at or datetime.min,
+            l.expires_at is None,
+            l.expires_at or datetime.max,
+            l.id,
+        ))
 
     @staticmethod
     def _build_cycle_schedule(
