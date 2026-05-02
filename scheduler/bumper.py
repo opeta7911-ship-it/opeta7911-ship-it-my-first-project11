@@ -234,32 +234,22 @@ class BumpEngine:
         per_filter: list[list[Lot]], duration: int
     ) -> dict[int, list[Lot]]:
         """
-        Maps each minute in [0, duration) to a filter's lot list.
-        The filter with the most lots fires most often (primary grid).
-        Secondary filters fill remaining minutes round-robin.
-
-        At each minute the caller picks the OLDEST lot from that filter's list,
-        so the specific lot chosen adapts to what has actually been bumped.
+        Assigns each filter a set of evenly-spaced minutes using greedy offset search.
+        Filters with more lots fire more often and claim slots first.
+        No two filters ever share the same minute.
         """
         sorted_filters = sorted(per_filter, key=lambda f: -len(f))
         schedule: dict[int, list[Lot]] = {}
 
-        primary = sorted_filters[0]
-        primary_step = duration / len(primary)
-        for k in range(len(primary)):
-            m = round(k * primary_step) % duration
-            schedule[m] = primary
-
-        available = [m for m in range(duration) if m not in schedule]
-        avail_idx = 0
-        secondaries = sorted_filters[1:]
-        if secondaries and available:
-            max_k = max(len(f) for f in secondaries)
-            for k in range(max_k):
-                for flt in secondaries:
-                    if k < len(flt) and avail_idx < len(available):
-                        schedule[available[avail_idx]] = flt
-                        avail_idx += 1
+        for flt_lots in sorted_filters:
+            n = min(len(flt_lots), duration)
+            step = duration / n
+            for offset in range(duration):
+                positions = [round(offset + k * step) % duration for k in range(n)]
+                if len(set(positions)) == n and all(p not in schedule for p in positions):
+                    for p in positions:
+                        schedule[p] = flt_lots
+                    break
 
         return schedule
 
