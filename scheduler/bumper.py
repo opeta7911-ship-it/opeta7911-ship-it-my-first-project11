@@ -163,7 +163,9 @@ class BumpEngine:
     async def _sleep_to_next_minute(self) -> None:
         now = datetime.now()
         next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-        await asyncio.sleep(max(0.0, (next_minute - now).total_seconds()))
+        # +0.3s buffer so the tick always fires well past the minute boundary,
+        # preventing the same cycle position from being calculated twice in a row.
+        await asyncio.sleep(max(0.0, (next_minute - now).total_seconds()) + 0.3)
 
     async def _tick(self) -> None:
         now = datetime.now()
@@ -186,8 +188,9 @@ class BumpEngine:
             for cycle in cycles_q.scalars().all():
                 lot = self._pick_from_cycle(cycle, now)
                 if lot is None:
-                    # Empty schedule slot — round-robin fallback across cycle filters
-                    lot = self._pick_cycle_fallback(cycle, now_utc)
+                    # Empty schedule slot — round-robin fallback, skipping already-bumped filters
+                    bumped_filter_ids = {l.filter_id for l in result}
+                    lot = self._pick_cycle_fallback(cycle, now_utc, bumped_filter_ids)
                     if lot is not None:
                         logger.info(
                             "CYCLE '%s' fallback — lot #%d (empty slot covered)",
@@ -335,11 +338,15 @@ class BumpEngine:
         )
         return lot
 
-    def _pick_cycle_fallback(self, cycle: Cycle, now_utc: datetime) -> Lot | None:
+    def _pick_cycle_fallback(
+        self, cycle: Cycle, now_utc: datetime, exclude_filter_ids: set[int] | None = None
+    ) -> Lot | None:
         """Round-robin fallback for empty cycle slots — picks the filter bumped longest ago."""
         candidates: list[tuple[datetime | None, list[Lot]]] = []
         for flt in cycle.filters:
             if not flt.enabled or not self._filter_has_budget(flt):
+                continue
+            if exclude_filter_ids and flt.id in exclude_filter_ids:
                 continue
             lots = [l for l in flt.lots if not l.paused]
             if not lots:
