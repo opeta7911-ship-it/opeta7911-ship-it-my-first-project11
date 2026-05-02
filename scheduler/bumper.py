@@ -200,7 +200,8 @@ class BumpEngine:
         return result
 
     def _pick_independent_global(self, filters: list[Filter], now_utc: datetime) -> list[Lot]:
-        filter_candidates: list[tuple[datetime | None, Filter, list[Lot]]] = []
+        # Each entry: (filter_on_cooldown, filter_last_bump, flt, sorted_lots)
+        filter_candidates = []
 
         for flt in filters:
             if not flt.interval_minutes:
@@ -210,42 +211,52 @@ class BumpEngine:
                 logger.debug("SKIP filter '%s' (id=%d): budget exhausted", flt.name, flt.id)
                 continue
 
-            all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at is not None]
-            filter_last_bump = max(all_bumped) if all_bumped else None
-
-            # Filter-level cooldown: the whole filter rests interval_minutes between bumps
-            if filter_last_bump is not None:
-                filter_elapsed = (now_utc - filter_last_bump).total_seconds() / 60
-                if filter_elapsed < flt.interval_minutes:
-                    logger.debug(
-                        "SKIP filter '%s' (id=%d): bumped %.1f min ago (interval=%d)",
-                        flt.name, flt.id, filter_elapsed, flt.interval_minutes,
-                    )
-                    continue
-
-            eligible = [l for l in flt.lots if not l.paused]
-            if not eligible:
-                logger.debug("SKIP filter '%s' (id=%d): no eligible lots", flt.name, flt.id)
+            lots = [l for l in flt.lots if not l.paused]
+            if not lots:
+                logger.debug("SKIP filter '%s' (id=%d): no lots", flt.name, flt.id)
                 continue
 
-            eligible.sort(key=lambda l: (l.expires_at is None, l.expires_at or datetime.max, l.id))
-            filter_candidates.append((filter_last_bump, flt, eligible))
+            def _elapsed(l: Lot) -> float:
+                return (now_utc - l.last_bumped_at).total_seconds() / 60 if l.last_bumped_at else float("inf")
+
+            def _lot_key(l: Lot):
+                on_cd = _elapsed(l) < flt.interval_minutes
+                return (
+                    on_cd,
+                    l.expires_at is None,
+                    l.expires_at or datetime.max,
+                    l.last_bumped_at is not None,
+                    l.last_bumped_at or datetime.min,
+                    l.id,
+                )
+
+            lots.sort(key=_lot_key)
+
+            all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
+            filter_last_bump = max(all_bumped) if all_bumped else None
+            # Filter is "on cooldown" when its best available lot is still within interval
+            filter_on_cooldown = _elapsed(lots[0]) < flt.interval_minutes
+
+            filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, lots))
 
         if not filter_candidates:
             logger.debug("ROBIN: no candidates this tick")
             return []
 
-        filter_candidates.sort(key=lambda x: (x[0] is not None, x[0] or datetime.min, x[1].id))
+        # Non-cooldown filters first; among equal cooldown state, oldest filter_last_bump first
+        filter_candidates.sort(
+            key=lambda x: (x[0], x[1] is not None, x[1] or datetime.min, x[2].id)
+        )
 
         logger.info(
             "ROBIN candidates: %s",
             ", ".join(
-                f"'{c[1].name}'(last={c[0].strftime('%H:%M:%S') if c[0] else 'never'})"
+                f"'{c[2].name}'(cd={c[0]},last={c[1].strftime('%H:%M:%S') if c[1] else 'never'})"
                 for c in filter_candidates
             ),
         )
 
-        _, best_flt, best_lots = filter_candidates[0]
+        _, _, best_flt, best_lots = filter_candidates[0]
         n = best_flt.lots_per_trigger or 1
         logger.info("ROBIN selected: '%s' → %d lot(s)", best_flt.name, n)
         return best_lots[:n]
