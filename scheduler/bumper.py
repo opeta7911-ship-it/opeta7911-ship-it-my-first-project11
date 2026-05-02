@@ -142,10 +142,9 @@ class BumpEngine:
 
     def _pick_independent_global(self, filters: list[Filter], now_utc: datetime) -> list[Lot]:
         """
-        Глобальный раунд-робин между всеми независимыми фильтрами.
-        Каждую минуту выбирается категория (фильтр), которая ждала дольше всех,
-        и из неё берётся lots_per_trigger лотов с наибольшим временем ожидания.
-        interval_minutes фильтра = минимальное время (мин) между поднятиями одного лота.
+        Глобальный раунд-робин между фильтрами.
+        Каждый тик выбирается фильтр, который ДОЛЬШЕ ВСЕХ не поднимал ни одного лота,
+        из него берётся лот с наибольшим временем ожидания.
         """
         filter_candidates: list[tuple[datetime | None, Filter, list[Lot]]] = []
 
@@ -166,18 +165,21 @@ class BumpEngine:
             if not eligible:
                 continue
 
-            # Сортируем лоты внутри фильтра: давно не поднятые — первые
-            eligible.sort(key=lambda l: (l.last_bumped_at or datetime.min, l.id))
+            # Возраст фильтра = когда он ПОСЛЕДНИЙ РАЗ поднимал ЛЮБОЙ лот.
+            # Фильтр с None (никогда не поднимал) → высший приоритет.
+            # Фильтр, который поднимал давнее всех → следующий.
+            all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at is not None]
+            filter_last_bump = max(all_bumped) if all_bumped else None
 
-            # «Возраст» фильтра = когда его самый старый лот был поднят в последний раз
-            oldest_bumped = eligible[0].last_bumped_at
-            filter_candidates.append((oldest_bumped, flt, eligible))
+            # Внутри фильтра сортируем лоты по времени ожидания (старые — первые)
+            eligible.sort(key=lambda l: (l.last_bumped_at is not None, l.last_bumped_at or datetime.min, l.id))
+            filter_candidates.append((filter_last_bump, flt, eligible))
 
         if not filter_candidates:
             return []
 
-        # Фильтр с never-bumped лотами идёт первым, затем сортировка по времени последнего поднятия
-        filter_candidates.sort(key=lambda x: (x[0] is not None, x[0] or datetime.min))
+        # Фильтры без единого поднятия — первыми, затем по времени последнего поднятия ASC
+        filter_candidates.sort(key=lambda x: (x[0] is not None, x[0] or datetime.min, x[1].id))
 
         _, best_flt, best_lots = filter_candidates[0]
         n = best_flt.lots_per_trigger or 1

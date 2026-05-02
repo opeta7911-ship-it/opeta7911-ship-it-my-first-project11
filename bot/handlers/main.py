@@ -40,15 +40,21 @@ async def cb_back_main(call: CallbackQuery, bump_engine) -> None:
 
 @router.callback_query(F.data == "toggle_engine")
 async def cb_toggle_engine(call: CallbackQuery, bump_engine) -> None:
-    await call.answer()
     if bump_engine.enabled:
         await bump_engine.stop()
     else:
         await bump_engine.start()
-    await call.message.edit_text(
-        _greeting(bump_engine.enabled),
-        reply_markup=main_menu(bump_engine.enabled),
-    )
+    try:
+        await call.answer()
+    except Exception:
+        pass
+    try:
+        await call.message.edit_text(
+            _greeting(bump_engine.enabled),
+            reply_markup=main_menu(bump_engine.enabled),
+        )
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data == "settings")
