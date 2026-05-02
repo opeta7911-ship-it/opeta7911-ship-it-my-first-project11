@@ -17,3 +17,11 @@ class CycleCreate(StatesGroup):
     waiting_for_name = State()
     waiting_for_start = State()
     waiting_for_duration = State()
+
+
+class CycleEditStart(StatesGroup):
+    waiting_for_start = State()
+
+
+class CycleEditDuration(StatesGroup):
+    waiting_for_minutes = State()

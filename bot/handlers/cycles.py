@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from bot.keyboards.menus import back_button, cycle_card, cycles_menu
-from bot.states import CycleCreate
+from bot.states import CycleCreate, CycleEditDuration, CycleEditStart
 from database.db import Database
 from database.models import Cycle, Filter
 
@@ -177,6 +177,69 @@ async def cb_cycle_delete(call: CallbackQuery, db: Database) -> None:
             await session.delete(cycle)
             await session.commit()
     await cb_cycles(call, db)
+
+
+@router.callback_query(F.data.startswith("cycle_start:"))
+async def cb_cycle_edit_start(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    cid = int(call.data.split(":")[1])
+    await state.set_state(CycleEditStart.waiting_for_start)
+    await state.update_data(cycle_id=cid)
+    await call.message.edit_text(
+        "Введи новое время старта (HH:MM, например 14:00):",
+        reply_markup=back_button(f"cycle:{cid}"),
+    )
+
+
+@router.message(CycleEditStart.waiting_for_start)
+async def msg_cycle_edit_start(message: Message, state: FSMContext, db: Database) -> None:
+    text = message.text.strip()
+    try:
+        h, m = (int(p) for p in text.split(":"))
+        assert 0 <= h < 24 and 0 <= m < 60
+    except (ValueError, AssertionError):
+        await message.answer("Неверный формат. Пример: 14:00")
+        return
+    data = await state.get_data()
+    cid = data["cycle_id"]
+    async with db.session_factory() as session:
+        cycle = await session.get(Cycle, cid)
+        if cycle:
+            cycle.start_time = f"{h:02d}:{m:02d}"
+            await session.commit()
+    await state.clear()
+    await _send_cycle_card(message, db, cid)
+
+
+@router.callback_query(F.data.startswith("cycle_duration:"))
+async def cb_cycle_edit_duration(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    cid = int(call.data.split(":")[1])
+    await state.set_state(CycleEditDuration.waiting_for_minutes)
+    await state.update_data(cycle_id=cid)
+    await call.message.edit_text(
+        "Введи новую длительность цикла в минутах (например 60):",
+        reply_markup=back_button(f"cycle:{cid}"),
+    )
+
+
+@router.message(CycleEditDuration.waiting_for_minutes)
+async def msg_cycle_edit_duration(message: Message, state: FSMContext, db: Database) -> None:
+    try:
+        minutes = int(message.text.strip())
+        assert minutes > 0
+    except (ValueError, AssertionError):
+        await message.answer("Нужно положительное число.")
+        return
+    data = await state.get_data()
+    cid = data["cycle_id"]
+    async with db.session_factory() as session:
+        cycle = await session.get(Cycle, cid)
+        if cycle:
+            cycle.duration_minutes = minutes
+            await session.commit()
+    await state.clear()
+    await _send_cycle_card(message, db, cid)
 
 
 @router.callback_query(F.data.startswith("cycle_togglefilter:"))
