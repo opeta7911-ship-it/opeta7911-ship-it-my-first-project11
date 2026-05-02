@@ -35,7 +35,9 @@ def _format_filter(flt: Filter) -> str:
             lines.append(f'  • <a href="{lot.url}">{lot.name}</a> · {lot.price_kopecks // 100}₽')
     else:
         lines.append("Лотов: 0")
-    if flt.interval_minutes:
+    if flt.cycle_id:
+        lines.append("Поднимать: ✅ настроено циклом")
+    elif flt.interval_minutes:
         lines.append(f"Поднимать: каждые {flt.interval_minutes} мин")
     else:
         lines.append("Поднимать: ⚠️ не настроено")
