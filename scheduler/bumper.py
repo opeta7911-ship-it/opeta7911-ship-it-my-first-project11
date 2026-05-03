@@ -46,22 +46,27 @@ class BumpEngine:
         self._task = asyncio.create_task(self._run_loop())
 
     async def _live_lots_loop(self) -> None:
-        """Refreshes live Playerok lots in background every 60s. Tick reads cached result instantly."""
+        """Refreshes live Playerok lots in background every 3 minutes."""
+        # Wait for startup sync to finish first (it already called get_my_lots)
+        await asyncio.sleep(180)
         while self._enabled:
             try:
                 self._live_lots = await self.playerok.get_my_lots()
                 logger.debug("Live lots refreshed: %d lots", len(self._live_lots))
+                await asyncio.sleep(180)
             except Exception as e:
-                logger.warning("Live lots refresh failed: %s", e)
-            await asyncio.sleep(60)
+                logger.warning("Live lots refresh failed: %s — retry in 5 min", e)
+                await asyncio.sleep(300)
 
     async def _startup_sync(self) -> None:
-        """On startup, sync all stored lots (non-keyword) against currently active Playerok lots."""
+        """On startup, sync stored lots and populate _live_lots cache."""
         try:
             active = await self.playerok.get_my_lots()
         except Exception as e:
             logger.warning("Startup sync: get_my_lots failed: %s", e)
             return
+        # Populate live lots cache immediately from startup data
+        self._live_lots = active
 
         active_ids = {a.playerok_id for a in active}
 
