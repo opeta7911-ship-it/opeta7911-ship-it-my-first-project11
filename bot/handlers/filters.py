@@ -4,7 +4,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+
 
 from bot.keyboards.menus import (
     back_button,
@@ -12,18 +12,14 @@ from bot.keyboards.menus import (
     filter_cycle_assign_menu,
     filters_menu,
     interval_menu,
-    lot_selection_menu,
     lots_per_trigger_menu,
 )
 from bot.states import FilterCreate, FilterEditIntervalCustom, FilterEditKeyword, FilterEditLimit
 from database.db import Database
-from database.models import Cycle, Filter, Lot
-from playerok.client import PlayerokClient
+from database.models import Cycle, Filter
 
 logger = logging.getLogger(__name__)
 router = Router()
-
-PAGE_SIZE = 8
 
 
 def _format_filter(flt: Filter) -> str:
@@ -31,14 +27,8 @@ def _format_filter(flt: Filter) -> str:
     lines.append(f"Состояние: {'🟢 ВКЛ' if flt.enabled else '🔴 ВЫКЛ'}")
     if flt.keyword:
         lines.append(f"🔑 Ключевое слово: <code>{flt.keyword}</code>")
-        lines.append("  Бот сам находит лоты по этому слову и поднимает самый старый.")
-    if flt.lots:
-        lines.append(f"Лотов в базе: {len(flt.lots)}")
-        for lot in flt.lots:
-            exp = f" · до {lot.expires_at.strftime('%d.%m')}" if lot.expires_at else ""
-            lines.append(f'  • <a href="{lot.url}">{lot.name}</a> · {lot.price_kopecks // 100}₽{exp}')
-    elif not flt.keyword:
-        lines.append("Лотов: 0 — добавь лоты или задай ключевое слово")
+    else:
+        lines.append("🔑 Ключевое слово: ⚠️ не задано")
     if flt.cycle_id:
         lines.append("Поднимать: ✅ настроено циклом")
     elif flt.interval_minutes:
@@ -58,7 +48,7 @@ def _format_filter(flt: Filter) -> str:
 
 async def _open_filter(call: CallbackQuery, db: Database, filter_id: int) -> None:
     async with db.session_factory() as session:
-        flt = await session.get(Filter, filter_id, options=[selectinload(Filter.lots)])
+        flt = await session.get(Filter, filter_id)
         if flt is None:
             await call.answer("Фильтр не найден", show_alert=True)
             return
@@ -74,7 +64,7 @@ async def _open_filter(call: CallbackQuery, db: Database, filter_id: int) -> Non
 
 async def _send_filter_card(message: Message, db: Database, filter_id: int) -> None:
     async with db.session_factory() as session:
-        flt = await session.get(Filter, filter_id, options=[selectinload(Filter.lots)])
+        flt = await session.get(Filter, filter_id)
         if flt is None:
             return
     await message.answer(
@@ -89,7 +79,7 @@ async def cb_filters(call: CallbackQuery, db: Database) -> None:
     await call.answer()
     async with db.session_factory() as session:
         result = await session.execute(
-            select(Filter).options(selectinload(Filter.lots)).order_by(Filter.order_index, Filter.id)
+            select(Filter).order_by(Filter.order_index, Filter.id)
         )
         flts = result.scalars().all()
     await call.message.edit_text(
@@ -123,7 +113,6 @@ async def msg_filter_name(message: Message, state: FSMContext, db: Database) -> 
 @router.callback_query(F.data.startswith("filter:"))
 async def cb_filter_open(call: CallbackQuery, db: Database, state: FSMContext) -> None:
     await call.answer()
-    await state.update_data(lots_cache=[])  # сбрасываем кэш лотов при возврате в карточку
     fid = int(call.data.split(":")[1])
     await _open_filter(call, db, fid)
 
@@ -182,159 +171,6 @@ async def msg_filter_keyword(message: Message, state: FSMContext, db: Database) 
             await session.commit()
     await state.clear()
     await _send_filter_card(message, db, fid)
-
-
-# ── Выбор лотов из списка ──────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("filter_lots_fetch:"))
-async def cb_filter_lots_fetch(
-    call: CallbackQuery, db: Database, playerok: PlayerokClient, state: FSMContext
-) -> None:
-    await call.answer()
-    parts = call.data.split(":")
-    fid, page = int(parts[1]), int(parts[2])
-
-    fsm_data = await state.get_data()
-    cached = fsm_data.get("lots_cache", [])
-
-    if cached:
-        # Пагинация — используем кэш, Playerok не трогаем
-        from playerok.client import MyLot
-        all_lots = [
-            MyLot(
-                playerok_id=l["playerok_id"],
-                slug=l["slug"],
-                name=l["name"],
-                price_kopecks=l["price_kopecks"],
-                bump_cost_kopecks=0,
-                bump_priority_status_id="",
-            )
-            for l in cached
-        ]
-    else:
-        # Первое открытие — загружаем с Playerok и кэшируем
-        try:
-            await call.message.edit_text("⏳ Загружаю лоты с Playerok...")
-        except Exception:
-            pass
-        try:
-            all_lots = await playerok.get_my_lots()
-        except Exception as exc:
-            try:
-                await call.message.edit_text(
-                    f"❌ Не удалось загрузить лоты: {exc}",
-                    reply_markup=back_button(f"filter:{fid}"),
-                )
-            except Exception:
-                pass
-            return
-        if not all_lots:
-            await call.message.edit_text(
-                "На Playerok нет активных лотов.",
-                reply_markup=back_button(f"filter:{fid}"),
-            )
-            return
-        await state.update_data(
-            lots_cache=[
-                {
-                    "playerok_id": l.playerok_id,
-                    "slug": l.slug,
-                    "name": l.name,
-                    "price_kopecks": l.price_kopecks,
-                    "expires_at": l.expires_at.isoformat() if l.expires_at else None,
-                }
-                for l in all_lots
-            ]
-        )
-
-    async with db.session_factory() as session:
-        flt = await session.get(Filter, fid, options=[selectinload(Filter.lots)])
-        if not flt:
-            await call.message.edit_text("Фильтр не найден.")
-            return
-        selected_ids = {lot.playerok_id for lot in flt.lots}
-
-    start = page * PAGE_SIZE
-    page_lots = all_lots[start: start + PAGE_SIZE]
-
-    try:
-        await call.message.edit_text(
-            f"<b>Выбери лоты для фильтра «{flt.name}»</b>\n"
-            f"Выбрано: {len(selected_ids)} из {len(all_lots)}",
-            reply_markup=lot_selection_menu(fid, page_lots, selected_ids, page, len(all_lots), PAGE_SIZE),
-        )
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data.startswith("lot_toggle:"))
-async def cb_lot_toggle(
-    call: CallbackQuery, db: Database, state: FSMContext
-) -> None:
-    parts = call.data.split(":")
-    fid, playerok_id, page = int(parts[1]), parts[2], int(parts[3])
-
-    # Отвечаем сразу — Telegram убирает спиннер не дожидаясь конца обработки
-    await call.answer()
-
-    fsm_data = await state.get_data()
-    cached = fsm_data.get("lots_cache", [])
-
-    async with db.session_factory() as session:
-        flt = await session.get(Filter, fid, options=[selectinload(Filter.lots)])
-        if not flt:
-            return
-
-        existing = next((l for l in flt.lots if l.playerok_id == playerok_id), None)
-        if existing:
-            await session.delete(existing)
-        else:
-            lot_info = next((l for l in cached if l["playerok_id"] == playerok_id), None)
-            if lot_info:
-                from datetime import datetime as _dt
-                from playerok.client import BASE_URL
-                raw_exp = lot_info.get("expires_at")
-                expires = _dt.fromisoformat(raw_exp) if raw_exp else None
-                # bump_cost сохраняем 0 — планировщик обновит цену прямо перед поднятием
-                session.add(Lot(
-                    filter_id=fid,
-                    playerok_id=lot_info["playerok_id"],
-                    url=f"{BASE_URL}{lot_info['slug']}",
-                    name=lot_info["name"],
-                    price_kopecks=lot_info["price_kopecks"],
-                    bump_cost_kopecks=0,
-                    expires_at=expires,
-                ))
-        await session.commit()
-        await session.refresh(flt, ["lots"])
-        selected_ids = {l.playerok_id for l in flt.lots}
-
-    # Если кэш есть — перерисовываем клавиатуру мгновенно, без API-запроса
-    if cached:
-        from playerok.client import MyLot
-        all_lots = [
-            MyLot(
-                playerok_id=l["playerok_id"],
-                slug=l["slug"],
-                name=l["name"],
-                price_kopecks=l["price_kopecks"],
-                bump_cost_kopecks=0,
-                bump_priority_status_id="",
-            )
-            for l in cached
-        ]
-    else:
-        try:
-            all_lots = await playerok.get_my_lots()
-        except Exception:
-            all_lots = []
-
-    start = page * PAGE_SIZE
-    page_lots = all_lots[start: start + PAGE_SIZE]
-    await call.message.edit_reply_markup(
-        reply_markup=lot_selection_menu(fid, page_lots, selected_ids, page, len(all_lots), PAGE_SIZE)
-    )
-    await call.answer()
 
 
 # ── Интервал поднятия ──────────────────────────────────────────────────────

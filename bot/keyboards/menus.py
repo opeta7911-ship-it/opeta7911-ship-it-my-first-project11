@@ -33,7 +33,7 @@ def filters_menu(filters: list[Filter]) -> InlineKeyboardMarkup:
         flag = "🟢" if f.enabled else "🔴"
         interval = f"{f.interval_minutes}мин" if f.interval_minutes else "не задан"
         kb.button(
-            text=f"{flag} {f.name} · {len(f.lots)} лот. · {interval}",
+            text=f"{flag} {f.name} · {interval}",
             callback_data=f"filter:{f.id}",
         )
     kb.button(text="➕ Создать фильтр", callback_data="filter_create")
@@ -48,7 +48,6 @@ def filter_card(flt: Filter) -> InlineKeyboardMarkup:
     kb.button(text=toggle, callback_data=f"filter_toggle:{flt.id}")
     kw_label = f"🔑 Ключ: {flt.keyword[:22]}" if flt.keyword else "🔑 Ключевое слово"
     kb.button(text=kw_label, callback_data=f"filter_keyword:{flt.id}")
-    kb.button(text="📋 Выбрать лоты вручную", callback_data=f"filter_lots_fetch:{flt.id}:0")
     kb.button(text="⏱ Когда поднимать", callback_data=f"filter_interval_menu:{flt.id}")
     kb.button(text=f"🛒 Лотов за раз: {flt.lots_per_trigger}", callback_data=f"filter_lpt_menu:{flt.id}")
     if flt.spend_limit_kopecks is not None:
@@ -60,7 +59,7 @@ def filter_card(flt: Filter) -> InlineKeyboardMarkup:
     kb.button(text="🔄 В цикл", callback_data=f"filter_cycle_assign:{flt.id}")
     kb.button(text="🗑 Удалить", callback_data=f"filter_delete:{flt.id}")
     kb.button(text="◀️ Назад", callback_data="filters")
-    kb.adjust(1, 1, 1, 2, 1, 1, 1, 1)
+    kb.adjust(1, 1, 2, 1, 1, 1, 1)
     return kb.as_markup()
 
 
