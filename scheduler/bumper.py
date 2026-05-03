@@ -72,7 +72,9 @@ class BumpEngine:
         self.playerok = playerok
         self.on_result = on_result
         self._task: asyncio.Task | None = None
+        self._live_lots_task: asyncio.Task | None = None
         self._enabled = False
+        self._live_lots: list[MyLot] = []  # refreshed in background every 60s
 
     @property
     def enabled(self) -> bool:
@@ -83,7 +85,18 @@ class BumpEngine:
             return
         self._enabled = True
         asyncio.create_task(self._startup_sync())
+        self._live_lots_task = asyncio.create_task(self._live_lots_loop())
         self._task = asyncio.create_task(self._run_loop())
+
+    async def _live_lots_loop(self) -> None:
+        """Refreshes live Playerok lots in background every 60s. Tick reads cached result instantly."""
+        while self._enabled:
+            try:
+                self._live_lots = await self.playerok.get_my_lots()
+                logger.debug("Live lots refreshed: %d lots", len(self._live_lots))
+            except Exception as e:
+                logger.warning("Live lots refresh failed: %s", e)
+            await asyncio.sleep(60)
 
     async def _startup_sync(self) -> None:
         """On startup, sync all stored lots (non-keyword) against currently active Playerok lots."""
@@ -146,13 +159,15 @@ class BumpEngine:
 
     async def stop(self) -> None:
         self._enabled = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        for task in (self._task, self._live_lots_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._live_lots_task = None
 
     async def _run_loop(self) -> None:
         await self._sleep_to_next_minute()
@@ -174,14 +189,8 @@ class BumpEngine:
         now = datetime.now()
         now_utc = datetime.utcnow()
 
-        # Fetch live lots once per tick (needed for keyword-based filters)
-        live_lots: list[MyLot] = []
-        try:
-            live_lots = await self.playerok.get_my_lots()
-        except Exception as e:
-            logger.warning("get_my_lots failed this tick: %s", e)
-
-        lots = await self._pick_next_lots(now, now_utc, live_lots)
+        # Use cached live lots — refreshed every 60s by _live_lots_loop (no blocking API call here)
+        lots = await self._pick_next_lots(now, now_utc, self._live_lots)
         if not lots:
             logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
         for lot in lots:
