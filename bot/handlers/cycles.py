@@ -12,25 +12,63 @@ from database.models import Cycle, Filter
 router = Router()
 
 
-def _format_cycle(cycle: Cycle, all_filters: list[Filter]) -> str:
-    in_cycle = [f for f in cycle.filters]
-    total_lots = sum(len(f.lots) for f in in_cycle)
-    capacity = cycle.duration_minutes
-    fit = "✅" if total_lots <= capacity else "⚠️"
+def _format_cycle(cycle: Cycle, all_filters: list[Filter], live_lots: list) -> str:
+    in_cycle = [f for f in cycle.filters if f.enabled]
+    dur = cycle.duration_minutes
+
     lines = [
         f"<b>Цикл: {cycle.name}</b>",
         "",
         f"Состояние: {'🟢 ВКЛ' if cycle.enabled else '🔴 ВЫКЛ'}",
-        f"Старт: {cycle.start_time}",
-        f"Длительность: {cycle.duration_minutes} мин",
-        f"Лотов в цикле: {total_lots} {fit}",
+        f"Старт: {cycle.start_time}  |  Длительность: {dur} мин",
+        "",
     ]
-    if total_lots > capacity:
+
+    if in_cycle:
+        lines.append("📅 <b>Как работает сейчас:</b>")
+        total_slots = 0
+        for flt in in_cycle:
+            if flt.keyword:
+                kw = flt.keyword.lower()
+                n = len([l for l in live_lots if kw in l.name.lower()])
+            else:
+                n = len([l for l in flt.lots if not l.paused])
+
+            if n == 0:
+                lines.append(f"  ⚠️ {flt.name} — лотов нет, пропускается")
+                continue
+
+            slots = min(n, dur)
+            interval = dur // slots
+            total_slots += slots
+            lines.append(
+                f"  • <b>{flt.name}</b> — {n} лот(а) "
+                f"→ поднимается каждые {interval} мин ({slots} раз за {dur} мин)"
+            )
+
+        filled = min(total_slots, dur)
+        empty = dur - filled
+        lines.append("")
         lines.append(
-            f"⚠️ Лотов больше чем минут. Увеличь длительность до {total_lots} или убери лоты."
+            f"Заполнено: {filled}/{dur} мин"
+            + (f" (пустых слотов: {empty})" if empty else " ✅ полностью")
         )
+
+        lines.append("")
+        lines.append(
+            "💡 <b>Как это работает:</b> Бот поднимает лоты каждую минуту по расписанию. "
+            "Каждый фильтр получает минуты пропорционально числу лотов. "
+            "В каждую свою минуту бот берёт самый старый лот фильтра (ближайший к истечению) и поднимает его."
+        )
+    else:
+        lines.append(
+            "Фильтров нет. Отметь галочкой ниже, чтобы добавить фильтр в цикл.\n\n"
+            "💡 <b>Как это работает:</b> Цикл сам распределяет фильтры по минутам. "
+            "Чем больше лотов у фильтра — тем чаще он поднимается."
+        )
+
     lines.append("")
-    lines.append("Отметь фильтры галочкой чтобы добавить/убрать из цикла:")
+    lines.append("Добавь/убери фильтры галочкой:")
     return "\n".join(lines)
 
 
@@ -80,7 +118,7 @@ async def msg_cycle_start(message: Message, state: FSMContext) -> None:
 
 @router.message(CycleCreate.waiting_for_duration)
 async def msg_cycle_duration(
-    message: Message, state: FSMContext, db: Database
+    message: Message, state: FSMContext, db: Database, bump_engine
 ) -> None:
     try:
         duration = int(message.text.strip())
@@ -99,10 +137,10 @@ async def msg_cycle_duration(
         await session.commit()
         new_id = cycle.id
     await state.clear()
-    await _send_cycle_card(message, db, new_id)
+    await _send_cycle_card(message, db, new_id, bump_engine)
 
 
-async def _send_cycle_card(message: Message, db: Database, cycle_id: int) -> None:
+async def _send_cycle_card(message: Message, db: Database, cycle_id: int, bump_engine) -> None:
     async with db.session_factory() as session:
         cycle = await session.get(
             Cycle, cycle_id,
@@ -110,33 +148,30 @@ async def _send_cycle_card(message: Message, db: Database, cycle_id: int) -> Non
         )
         if cycle is None:
             return
-        result = await session.execute(
-            select(Filter).options(selectinload(Filter.lots)).order_by(Filter.id)
-        )
+        result = await session.execute(select(Filter).order_by(Filter.id))
         all_filters = result.scalars().all()
+    live_lots = getattr(bump_engine, "_live_lots", [])
     await message.answer(
-        _format_cycle(cycle, all_filters),
+        _format_cycle(cycle, all_filters, live_lots),
         reply_markup=cycle_card(cycle, all_filters),
     )
 
 
-async def _open_cycle(call: CallbackQuery, db: Database, cycle_id: int) -> None:
+async def _open_cycle(call: CallbackQuery, db: Database, cycle_id: int, bump_engine) -> None:
     async with db.session_factory() as session:
         cycle = await session.get(
-            Cycle,
-            cycle_id,
+            Cycle, cycle_id,
             options=[selectinload(Cycle.filters).selectinload(Filter.lots)],
         )
         if cycle is None:
             await call.answer("Цикл не найден", show_alert=True)
             return
-        result = await session.execute(
-            select(Filter).options(selectinload(Filter.lots)).order_by(Filter.id)
-        )
+        result = await session.execute(select(Filter).order_by(Filter.id))
         all_filters = result.scalars().all()
+    live_lots = getattr(bump_engine, "_live_lots", [])
     try:
         await call.message.edit_text(
-            _format_cycle(cycle, all_filters),
+            _format_cycle(cycle, all_filters, live_lots),
             reply_markup=cycle_card(cycle, all_filters),
         )
     except Exception:
@@ -144,14 +179,14 @@ async def _open_cycle(call: CallbackQuery, db: Database, cycle_id: int) -> None:
 
 
 @router.callback_query(F.data.startswith("cycle:"))
-async def cb_cycle_open(call: CallbackQuery, db: Database) -> None:
+async def cb_cycle_open(call: CallbackQuery, db: Database, bump_engine) -> None:
     await call.answer()
     cid = int(call.data.split(":")[1])
-    await _open_cycle(call, db, cid)
+    await _open_cycle(call, db, cid, bump_engine)
 
 
 @router.callback_query(F.data.startswith("cycle_toggle:"))
-async def cb_cycle_toggle(call: CallbackQuery, db: Database) -> None:
+async def cb_cycle_toggle(call: CallbackQuery, db: Database, bump_engine) -> None:
     await call.answer()
     cid = int(call.data.split(":")[1])
     async with db.session_factory() as session:
@@ -159,7 +194,7 @@ async def cb_cycle_toggle(call: CallbackQuery, db: Database) -> None:
         if cycle:
             cycle.enabled = not cycle.enabled
             await session.commit()
-    await _open_cycle(call, db, cid)
+    await _open_cycle(call, db, cid, bump_engine)
 
 
 @router.callback_query(F.data.startswith("cycle_delete:"))
@@ -192,7 +227,7 @@ async def cb_cycle_edit_start(call: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(CycleEditStart.waiting_for_start)
-async def msg_cycle_edit_start(message: Message, state: FSMContext, db: Database) -> None:
+async def msg_cycle_edit_start(message: Message, state: FSMContext, db: Database, bump_engine) -> None:
     text = message.text.strip()
     try:
         h, m = (int(p) for p in text.split(":"))
@@ -208,7 +243,7 @@ async def msg_cycle_edit_start(message: Message, state: FSMContext, db: Database
             cycle.start_time = f"{h:02d}:{m:02d}"
             await session.commit()
     await state.clear()
-    await _send_cycle_card(message, db, cid)
+    await _send_cycle_card(message, db, cid, bump_engine)
 
 
 @router.callback_query(F.data.startswith("cycle_duration:"))
@@ -224,7 +259,7 @@ async def cb_cycle_edit_duration(call: CallbackQuery, state: FSMContext) -> None
 
 
 @router.message(CycleEditDuration.waiting_for_minutes)
-async def msg_cycle_edit_duration(message: Message, state: FSMContext, db: Database) -> None:
+async def msg_cycle_edit_duration(message: Message, state: FSMContext, db: Database, bump_engine) -> None:
     try:
         minutes = int(message.text.strip())
         assert minutes > 0
@@ -239,11 +274,11 @@ async def msg_cycle_edit_duration(message: Message, state: FSMContext, db: Datab
             cycle.duration_minutes = minutes
             await session.commit()
     await state.clear()
-    await _send_cycle_card(message, db, cid)
+    await _send_cycle_card(message, db, cid, bump_engine)
 
 
 @router.callback_query(F.data.startswith("cycle_togglefilter:"))
-async def cb_cycle_togglefilter(call: CallbackQuery, db: Database) -> None:
+async def cb_cycle_togglefilter(call: CallbackQuery, db: Database, bump_engine) -> None:
     await call.answer()
     _, cid_s, fid_s = call.data.split(":")
     cid, fid = int(cid_s), int(fid_s)
@@ -262,4 +297,4 @@ async def cb_cycle_togglefilter(call: CallbackQuery, db: Database) -> None:
                 last_flt = last.scalars().first()
                 flt.order_index = (last_flt.order_index + 1) if last_flt and last_flt.id != flt.id else 0
             await session.commit()
-    await _open_cycle(call, db, cid)
+    await _open_cycle(call, db, cid, bump_engine)

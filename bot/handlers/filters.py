@@ -3,7 +3,7 @@ import logging
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select, update
+from sqlalchemy import desc, select, update
 
 
 from bot.keyboards.menus import (
@@ -16,7 +16,7 @@ from bot.keyboards.menus import (
 )
 from bot.states import FilterCreate, FilterEditIntervalCustom, FilterEditKeyword, FilterEditLimit
 from database.db import Database
-from database.models import Cycle, Filter
+from database.models import BumpHistory, Cycle, Filter, Lot
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -335,6 +335,78 @@ async def cb_filter_cycle_set(call: CallbackQuery, db: Database) -> None:
     else:
         await call.answer("✅ Сохранено")
     await _open_filter(call, db, fid)
+
+
+LOGS_PAGE_SIZE = 10
+
+
+@router.callback_query(F.data.startswith("filter_logs:"))
+async def cb_filter_logs(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
+    parts = call.data.split(":")
+    fid, page = int(parts[1]), int(parts[2])
+
+    async with db.session_factory() as session:
+        flt = await session.get(Filter, fid)
+        if not flt:
+            return
+
+        total_q = await session.execute(
+            select(BumpHistory)
+            .join(Lot, BumpHistory.lot_id == Lot.id)
+            .where(Lot.filter_id == fid)
+        )
+        total = len(total_q.scalars().all())
+
+        result = await session.execute(
+            select(BumpHistory, Lot)
+            .join(Lot, BumpHistory.lot_id == Lot.id)
+            .where(Lot.filter_id == fid)
+            .order_by(desc(BumpHistory.occurred_at))
+            .offset(page * LOGS_PAGE_SIZE)
+            .limit(LOGS_PAGE_SIZE)
+        )
+        rows = result.all()
+
+    if not rows:
+        try:
+            await call.message.edit_text(
+                f"<b>Логи фильтра «{flt.name}»</b>\n\nПоднятий ещё не было.",
+                reply_markup=back_button(f"filter:{fid}"),
+            )
+        except Exception:
+            pass
+        return
+
+    lines = [f"<b>Логи фильтра «{flt.name}»</b>  (стр. {page+1})\n"]
+    for hist, lot in rows:
+        dt = hist.occurred_at.strftime("%d.%m %H:%M")
+        icon = "✅" if hist.success else "❌"
+        cost = f" {hist.cost_kopecks // 100}₽" if hist.success and hist.cost_kopecks else ""
+        lines.append(f'{icon} {dt}{cost}\n└ <a href="{lot.url}">{lot.name[:40]}</a>')
+
+    from aiogram.types import InlineKeyboardButton
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    kb = InlineKeyboardBuilder()
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"filter_logs:{fid}:{page-1}"))
+    pages = (total + LOGS_PAGE_SIZE - 1) // LOGS_PAGE_SIZE
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop"))
+    if (page + 1) * LOGS_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"filter_logs:{fid}:{page+1}"))
+    if nav:
+        kb.row(*nav)
+    kb.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"filter:{fid}"))
+
+    try:
+        await call.message.edit_text(
+            "\n".join(lines),
+            reply_markup=kb.as_markup(),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data == "filters_disable_all")

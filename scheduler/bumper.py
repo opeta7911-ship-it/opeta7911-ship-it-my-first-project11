@@ -625,8 +625,8 @@ class BumpEngine:
                     flt.spent_kopecks = 0
                     flt.limit_reset_at = None
 
-            # Record period start on first spend
-            if flt.spend_limit_kopecks is not None and flt.spent_kopecks == 0:
+            # Record period start (on first spend, or if cleared by restart)
+            if flt.spend_limit_kopecks is not None and flt.limit_reset_at is None:
                 flt.limit_reset_at = now
 
             lot.last_bumped_at = now

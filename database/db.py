@@ -13,6 +13,7 @@ _MIGRATIONS = [
     "ALTER TABLE filters ADD COLUMN limit_reset_at DATETIME",
     "ALTER TABLE lots ADD COLUMN expires_at DATETIME",
     "ALTER TABLE filters ADD COLUMN keyword TEXT",
+    "UPDATE filters SET limit_reset_at = NULL",
 ]
 
 
