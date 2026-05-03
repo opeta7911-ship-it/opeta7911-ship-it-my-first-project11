@@ -31,7 +31,8 @@ class BumpEngine:
         self._task: asyncio.Task | None = None
         self._live_lots_task: asyncio.Task | None = None
         self._enabled = False
-        self._live_lots: list[MyLot] = []  # refreshed in background every 60s
+        self._live_lots: list[MyLot] = []  # refreshed in background every 3 min
+        self._startup_done: asyncio.Event = asyncio.Event()
 
     @property
     def enabled(self) -> bool:
@@ -41,14 +42,19 @@ class BumpEngine:
         if self._task and not self._task.done():
             return
         self._enabled = True
+        self._startup_done.clear()
         asyncio.create_task(self._startup_sync())
         self._live_lots_task = asyncio.create_task(self._live_lots_loop())
         self._task = asyncio.create_task(self._run_loop())
 
     async def _live_lots_loop(self) -> None:
         """Refreshes live Playerok lots in background every 3 minutes."""
-        # Wait for startup sync to finish first (it already called get_my_lots)
-        await asyncio.sleep(180)
+        # Wait for startup_sync to finish (it already called get_my_lots on success)
+        await self._startup_done.wait()
+        if self._live_lots:
+            # Startup succeeded — wait normal 3-min interval before next refresh
+            await asyncio.sleep(180)
+        # else: startup failed — lots are empty, so refresh immediately without extra delay
         while self._enabled:
             try:
                 self._live_lots = await self.playerok.get_my_lots()
@@ -64,9 +70,11 @@ class BumpEngine:
             active = await self.playerok.get_my_lots()
         except Exception as e:
             logger.warning("Startup sync: get_my_lots failed: %s", e)
+            self._startup_done.set()  # signal loop to start refreshing immediately
             return
         # Populate live lots cache immediately from startup data
         self._live_lots = active
+        self._startup_done.set()
 
         active_ids = {a.playerok_id for a in active}
 
@@ -221,10 +229,9 @@ class BumpEngine:
                 if not matches:
                     logger.debug("SKIP filter '%s' (id=%d): keyword '%s' no matches", flt.name, flt.id, flt.keyword)
                     continue
-                # Pick oldest live lot
+                # Pick oldest live lot (None expires_at = oldest priority)
                 best_live = min(matches, key=lambda l: (
-                    l.expires_at is None,
-                    l.expires_at or datetime.max,
+                    l.expires_at if l.expires_at is not None else datetime.min,
                     l.playerok_id,
                 ))
                 # Determine filter cooldown from DB lots' last_bumped_at
@@ -336,8 +343,7 @@ class BumpEngine:
                 )
                 return None
             best_live = min(matches, key=lambda l: (
-                l.expires_at is None,
-                l.expires_at or datetime.max,
+                l.expires_at if l.expires_at is not None else datetime.min,
                 l.playerok_id,
             ))
             logger.info(
@@ -404,8 +410,7 @@ class BumpEngine:
 
         if is_keyword:
             best_live = min(data, key=lambda l: (
-                l.expires_at is None,
-                l.expires_at or datetime.max,
+                l.expires_at if l.expires_at is not None else datetime.min,
                 l.playerok_id,
             ))
             return await self._get_or_create_keyword_lot(best_flt.id, best_live)
