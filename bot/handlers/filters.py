@@ -3,7 +3,7 @@ import logging
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 
 from bot.keyboards.menus import (
@@ -37,7 +37,12 @@ def _format_filter(flt: Filter) -> str:
         lines.append("Поднимать: ⚠️ не настроено")
     lines.append(f"Лотов за раз: {flt.lots_per_trigger}")
     if flt.spend_limit_kopecks is not None:
-        reset_info = f" · сброс в 12:00" if flt.limit_reset_at else ""
+        from datetime import timedelta
+        if flt.limit_reset_at:
+            reset_at = flt.limit_reset_at + timedelta(hours=24)
+            reset_info = f" · сброс в {reset_at.strftime('%H:%M')}"
+        else:
+            reset_info = ""
         lines.append(f"Лимит/сутки: {flt.spent_kopecks//100}₽ / {flt.spend_limit_kopecks//100}₽{reset_info}")
     else:
         lines.append("Лимит/сутки: нет")
@@ -330,6 +335,17 @@ async def cb_filter_cycle_set(call: CallbackQuery, db: Database) -> None:
     else:
         await call.answer("✅ Сохранено")
     await _open_filter(call, db, fid)
+
+
+@router.callback_query(F.data == "filters_disable_all")
+async def cb_filters_disable_all(call: CallbackQuery, db: Database) -> None:
+    await call.answer("⛔ Все фильтры выключены")
+    async with db.session_factory() as session:
+        await session.execute(update(Filter).values(enabled=False))
+        await session.commit()
+        result = await session.execute(select(Filter).order_by(Filter.order_index, Filter.id))
+        flts = result.scalars().all()
+    await call.message.edit_reply_markup(reply_markup=filters_menu(flts))
 
 
 @router.callback_query(F.data == "noop")

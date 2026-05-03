@@ -3,7 +3,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
 from database.db import Database
@@ -14,49 +14,6 @@ logger = logging.getLogger(__name__)
 
 BumpCallback = Callable[[Lot, bool, int, str | None], Awaitable[None]]
 
-
-class DailyResetTask:
-    """Сбрасывает потраченный бюджет фильтров каждый день в 12:00 по местному времени."""
-
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self._task: asyncio.Task | None = None
-
-    async def start(self) -> None:
-        if self._task and not self._task.done():
-            return
-        self._task = asyncio.create_task(self._run())
-
-    async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-
-    async def _run(self) -> None:
-        while True:
-            await self._sleep_until_noon()
-            await self._reset_budgets()
-
-    async def _sleep_until_noon(self) -> None:
-        now = datetime.now()
-        noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
-        if now >= noon:
-            noon += timedelta(days=1)
-        await asyncio.sleep((noon - now).total_seconds())
-
-    async def _reset_budgets(self) -> None:
-        now = datetime.now()
-        async with self.db.session_factory() as session:
-            await session.execute(
-                update(Filter)
-                .where(Filter.spend_limit_kopecks.isnot(None))
-                .values(spent_kopecks=0, limit_reset_at=now)
-            )
-            await session.commit()
-        logger.info("Daily limit reset executed at %s", now.strftime("%H:%M"))
 
 
 class BumpEngine:
@@ -659,9 +616,22 @@ class BumpEngine:
             lot = await session.get(Lot, lot_id, options=[selectinload(Lot.filter)])
             if lot is None:
                 return
-            lot.last_bumped_at = datetime.utcnow()
+            flt = lot.filter
+            now = datetime.utcnow()
+
+            # 24h rolling limit reset: if 24h have passed since period start → reset
+            if flt.spend_limit_kopecks is not None and flt.limit_reset_at is not None:
+                if (now - flt.limit_reset_at).total_seconds() >= 86400:
+                    flt.spent_kopecks = 0
+                    flt.limit_reset_at = None
+
+            # Record period start on first spend
+            if flt.spend_limit_kopecks is not None and flt.spent_kopecks == 0:
+                flt.limit_reset_at = now
+
+            lot.last_bumped_at = now
             lot.bump_cost_kopecks = cost_kopecks
-            lot.filter.spent_kopecks += cost_kopecks
+            flt.spent_kopecks += cost_kopecks
             session.add(BumpHistory(lot_id=lot.id, success=True, cost_kopecks=cost_kopecks))
             await session.commit()
             await session.refresh(lot, ["filter"])

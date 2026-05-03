@@ -10,7 +10,7 @@ from config import load_config
 from database.db import Database
 from database.models import Lot
 from playerok.client import PlayerokClient
-from scheduler.bumper import BumpEngine, DailyResetTask
+from scheduler.bumper import BumpEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -51,7 +51,6 @@ async def main() -> None:
             logger.exception("Failed to send bump notification")
 
     engine = BumpEngine(db=db, playerok=playerok, on_result=on_bump_result)
-    daily_reset = DailyResetTask(db=db)
 
     dp = Dispatcher()
     dp["db"] = db
@@ -63,11 +62,9 @@ async def main() -> None:
 
     logger.info("Bot starting...")
     try:
-        await daily_reset.start()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await engine.stop()
-        await daily_reset.stop()
         await db.close()
         await bot.session.close()
 

@@ -23,7 +23,8 @@ def main_menu(running: bool) -> InlineKeyboardMarkup:
     kb.button(text="📜 История", callback_data="history")
     kb.button(text="⚙️ Настройки", callback_data="settings")
     kb.button(text="🔄 Циклы", callback_data="cycles")
-    kb.adjust(1, 2, 2, 1)
+    kb.button(text="🗑 Сброс", callback_data="reset_request")
+    kb.adjust(1, 2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -36,6 +37,7 @@ def filters_menu(filters: list[Filter]) -> InlineKeyboardMarkup:
             text=f"{flag} {f.name} · {interval}",
             callback_data=f"filter:{f.id}",
         )
+    kb.button(text="⛔ Выключить все", callback_data="filters_disable_all")
     kb.button(text="➕ Создать фильтр", callback_data="filter_create")
     kb.button(text="◀️ Назад", callback_data="back_main")
     kb.adjust(1)
@@ -167,6 +169,14 @@ def stats_menu() -> InlineKeyboardMarkup:
         kb.button(text=label, callback_data=f"stats:{code}")
     kb.button(text="◀️ Назад", callback_data="back_main")
     kb.adjust(2, 2, 2, 1, 1)
+    return kb.as_markup()
+
+
+def reset_confirm_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, сбросить всё", callback_data="reset_confirm")
+    kb.button(text="❌ Отмена", callback_data="back_main")
+    kb.adjust(1)
     return kb.as_markup()
 
 
