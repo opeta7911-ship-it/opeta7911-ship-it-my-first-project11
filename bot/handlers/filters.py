@@ -383,7 +383,8 @@ async def cb_filter_logs(call: CallbackQuery, db: Database) -> None:
         dt = hist.occurred_at.strftime("%d.%m %H:%M")
         icon = "✅" if hist.success else "❌"
         cost = f" {hist.cost_kopecks // 100}₽" if hist.success and hist.cost_kopecks else ""
-        lines.append(f'{icon} {dt}{cost}\n└ <a href="{lot.url}">{lot.name[:40]}</a>')
+        lot_name = lot.name[:40] or f"Лот #{hist.lot_id}"
+        lines.append(f'{icon} {dt}{cost}\n└ <a href="{lot.url}">{lot_name}</a>')
 
     from aiogram.types import InlineKeyboardButton
     from aiogram.utils.keyboard import InlineKeyboardBuilder

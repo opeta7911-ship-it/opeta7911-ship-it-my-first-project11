@@ -33,15 +33,16 @@ async def main() -> None:
         # Короткий идентификатор из URL — чтобы видеть что поднимаются РАЗНЫЕ лоты
         # (даже если у нескольких лотов одинаковое название на Playerok)
         slug_id = lot.url.rsplit("/", 1)[-1].split("-", 1)[0][:8]
+        name = lot.name or f"Лот #{lot.id}"
         if success:
             text = (
-                f'🚀 <a href="{lot.url}">{lot.name}</a>\n'
+                f'🚀 <a href="{lot.url}">{name}</a>\n'
                 f"Поднято ✅  ({cost_kopecks / 100:.0f}₽ / {lot.price_kopecks / 100:.0f}₽)\n"
                 f"<code>#{lot.id} · {slug_id}</code>"
             )
         else:
             text = (
-                f'❌ <a href="{lot.url}">{lot.name}</a>\n'
+                f'❌ <a href="{lot.url}">{name}</a>\n'
                 f"Не поднят — {error or 'неизвестная ошибка'}\n"
                 f"<code>#{lot.id} · {slug_id}</code>"
             )
