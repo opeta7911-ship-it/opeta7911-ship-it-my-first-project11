@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ — заполни перед запуском
 # ══════════════════════════════════════════════════════════════════════
-BOT_TOKEN    = "ВСТАВЬ_ТОКЕН_БОТА"
-ADMIN_ID     = 0          # твой Telegram ID (узнать у @userinfobot)
+BOT_TOKEN    = "8656721775:AAFbh73ynql04rDuC4-IFOtoOrCVgCq6kHw"
+ADMIN_IDS    = [1330689833, 6837940569]   # список админов
 FUNPAY_KEY   = ""         # golden_key от FunPay (необязательно для старта)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -551,7 +551,7 @@ def _get_monitor() -> FunPayMonitor:
 def _admin_only(func):
     async def wrapper(obj, **kw):
         uid = obj.from_user.id if hasattr(obj, "from_user") else 0
-        if ADMIN_ID and uid != ADMIN_ID:
+        if ADMIN_IDS and uid not in ADMIN_IDS:
             return
         return await func(obj, **kw)
     wrapper.__name__ = func.__name__
@@ -573,7 +573,7 @@ async def show_main(target, s: dict, edit: bool = False):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    if ADMIN_ID and message.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
         return
     await state.clear()
     s = load_settings()
@@ -584,7 +584,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("toggle:"))
 async def cb_toggle(call: CallbackQuery):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     key = call.data.split(":")[1]
     s = load_settings()
@@ -598,7 +598,7 @@ async def cb_toggle(call: CallbackQuery):
 
 @router.callback_query(F.data == "action:refresh")
 async def cb_refresh(call: CallbackQuery):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     s = load_settings()
     await call.answer("Обновлено")
@@ -607,7 +607,7 @@ async def cb_refresh(call: CallbackQuery):
 
 @router.callback_query(F.data == "action:back")
 async def cb_back(call: CallbackQuery, state: FSMContext):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     await state.clear()
     s = load_settings()
@@ -618,7 +618,7 @@ async def cb_back(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "manual:request")
 async def cb_manual_request(call: CallbackQuery, state: FSMContext):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(States.manual_request_game)
     kb = IKM(inline_keyboard=[
@@ -668,7 +668,7 @@ async def msg_manual_email(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "manual:validate")
 async def cb_manual_validate(call: CallbackQuery, state: FSMContext):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     # Если уже есть ожидание из manual request — переходим к вводу кода
     data = await state.get_data()
@@ -705,7 +705,7 @@ async def msg_manual_code(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "action:upload_bins")
 async def cb_upload_bins(call: CallbackQuery, state: FSMContext):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(States.upload_bins)
     await call.message.edit_text(
@@ -775,7 +775,7 @@ MSG_VARS = {
 
 @router.callback_query(F.data == "action:texts")
 async def cb_texts(call: CallbackQuery):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     await call.message.edit_text("💬 Выбери текст для редактирования:", reply_markup=texts_kb())
     await call.answer()
@@ -814,7 +814,7 @@ async def msg_edit_msg(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "action:funpay")
 async def cb_funpay(call: CallbackQuery, state: FSMContext):
-    if ADMIN_ID and call.from_user.id != ADMIN_ID:
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
         return
     s  = load_settings()
     cur = s.get("funpay_key", "")
