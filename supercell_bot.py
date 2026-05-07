@@ -472,29 +472,29 @@ def v(flag: bool) -> str:
 
 def main_menu_kb(s: dict) -> IKM:
     return IKM(inline_keyboard=[
-        [IKB(f"{v(s['auto_request'])} Авто-запрос",  callback_data="toggle:auto_request"),
-         IKB(f"{v(s['validate_code'])} Авто-проверка", callback_data="toggle:validate_code")],
-        [IKB("🤖 Запросить код",  callback_data="manual:request"),
-         IKB("🔍 Проверить код",  callback_data="manual:validate")],
-        [IKB("📁 Загрузить бины", callback_data="action:upload_bins"),
-         IKB("💬 Тексты",         callback_data="action:texts")],
-        [IKB("🔑 FunPay",         callback_data="action:funpay"),
-         IKB("🔄 Обновить",       callback_data="action:refresh")],
+        [IKB(text=f"{v(s['auto_request'])} Авто-запрос",  callback_data="toggle:auto_request"),
+         IKB(text=f"{v(s['validate_code'])} Авто-проверка", callback_data="toggle:validate_code")],
+        [IKB(text="🤖 Запросить код",  callback_data="manual:request"),
+         IKB(text="🔍 Проверить код",  callback_data="manual:validate")],
+        [IKB(text="📁 Загрузить бины", callback_data="action:upload_bins"),
+         IKB(text="💬 Тексты",         callback_data="action:texts")],
+        [IKB(text="🔑 FunPay",         callback_data="action:funpay"),
+         IKB(text="🔄 Обновить",       callback_data="action:refresh")],
     ])
 
 
 def texts_kb() -> IKM:
     return IKM(inline_keyboard=[
-        [IKB("📦 Новый заказ",   callback_data="editmsg:new_order")],
-        [IKB("📨 Код запрошен",  callback_data="editmsg:code_requested")],
-        [IKB("✅ Код верный",    callback_data="editmsg:code_valid")],
-        [IKB("❌ Код неверный",  callback_data="editmsg:code_invalid")],
-        [IKB("◀️ Назад",         callback_data="action:back")],
+        [IKB(text="📦 Новый заказ",   callback_data="editmsg:new_order")],
+        [IKB(text="📨 Код запрошен",  callback_data="editmsg:code_requested")],
+        [IKB(text="✅ Код верный",    callback_data="editmsg:code_valid")],
+        [IKB(text="❌ Код неверный",  callback_data="editmsg:code_invalid")],
+        [IKB(text="◀️ Назад",         callback_data="action:back")],
     ])
 
 
 def back_kb() -> IKM:
-    return IKM(inline_keyboard=[[IKB("◀️ Назад", callback_data="action:back")]])
+    return IKM(inline_keyboard=[[IKB(text="◀️ Назад", callback_data="action:back")]])
 
 
 # ── Main menu text ──────────────────────────────────────────────────────────────
@@ -622,10 +622,10 @@ async def cb_manual_request(call: CallbackQuery, state: FSMContext):
         return
     await state.set_state(States.manual_request_game)
     kb = IKM(inline_keyboard=[
-        [IKB("🔥 Brawl Stars",   callback_data="pick_game:laser"),
-         IKB("👑 Clash Royale",   callback_data="pick_game:scroll")],
-        [IKB("⚔️ Clash of Clans", callback_data="pick_game:magic")],
-        [IKB("◀️ Назад",          callback_data="action:back")],
+        [IKB(text="🔥 Brawl Stars",   callback_data="pick_game:laser"),
+         IKB(text="👑 Clash Royale",   callback_data="pick_game:scroll")],
+        [IKB(text="⚔️ Clash of Clans", callback_data="pick_game:magic")],
+        [IKB(text="◀️ Назад",          callback_data="action:back")],
     ])
     await call.message.edit_text("Выбери игру:", reply_markup=kb)
     await call.answer()
