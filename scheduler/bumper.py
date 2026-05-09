@@ -48,21 +48,27 @@ class BumpEngine:
         self._task = asyncio.create_task(self._run_loop())
 
     async def _live_lots_loop(self) -> None:
-        """Refreshes live Playerok lots in background every 3 minutes."""
-        # Wait for startup_sync to finish (it already called get_my_lots on success)
+        """Refreshes live Playerok lots in background every 90 seconds."""
         await self._startup_done.wait()
         if self._live_lots:
-            # Startup succeeded — wait normal 3-min interval before next refresh
-            await asyncio.sleep(180)
-        # else: startup failed — lots are empty, so refresh immediately without extra delay
+            await asyncio.sleep(90)
         while self._enabled:
             try:
                 self._live_lots = await self.playerok.get_my_lots()
                 logger.debug("Live lots refreshed: %d lots", len(self._live_lots))
-                await asyncio.sleep(180)
+                await asyncio.sleep(90)
             except Exception as e:
-                logger.warning("Live lots refresh failed: %s — retry in 5 min", e)
-                await asyncio.sleep(300)
+                logger.warning("Live lots refresh failed: %s — retry in 3 min", e)
+                await asyncio.sleep(180)
+
+    async def _post_bump_refresh(self) -> None:
+        """Refresh live lots 8 seconds after a bump to get fresh priority_position data."""
+        await asyncio.sleep(8)
+        try:
+            self._live_lots = await self.playerok.get_my_lots()
+            logger.debug("Post-bump refresh: %d lots", len(self._live_lots))
+        except Exception as e:
+            logger.warning("Post-bump refresh failed: %s", e)
 
     async def _startup_sync(self) -> None:
         """On startup, sync stored lots and populate _live_lots cache."""
@@ -162,17 +168,24 @@ class BumpEngine:
         # Emergency position bumps — fire before normal schedule
         emergency_lots = await self._pick_position_emergency(now_utc, self._live_lots)
         bumped_filter_ids: set[int] = set()
+        any_bumped = False
         for lot in emergency_lots:
             await self._bump_lot(lot)
             bumped_filter_ids.add(lot.filter_id)
+            any_bumped = True
 
-        # Use cached live lots — refreshed every 3 min by _live_lots_loop
+        # Use cached live lots — refreshed in background by _live_lots_loop
         lots = await self._pick_next_lots(now, now_utc, self._live_lots)
         for lot in lots:
             if lot.filter_id not in bumped_filter_ids:
                 await self._bump_lot(lot)
-        if not emergency_lots and not lots:
+                any_bumped = True
+        if not any_bumped:
             logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
+            return
+
+        # Refresh live lots shortly after bumping so position data is fresh
+        asyncio.create_task(self._post_bump_refresh())
 
     async def _pick_position_emergency(self, now_utc: datetime, live_lots: list[MyLot]) -> list["Lot"]:
         """For filters with top_position set: if any lot is outside target, bump immediately."""
@@ -210,10 +223,10 @@ class BumpEngine:
                 )
                 continue
 
-            # Check that we haven't emergency-bumped this filter in the last 90 seconds
+            # Check that we haven't bumped this filter in the last 50 seconds
             all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at]
             last_bump = max(all_bumped) if all_bumped else None
-            if last_bump and (now_utc - last_bump).total_seconds() < 90:
+            if last_bump and (now_utc - last_bump).total_seconds() < 50:
                 continue
 
             logger.info(
