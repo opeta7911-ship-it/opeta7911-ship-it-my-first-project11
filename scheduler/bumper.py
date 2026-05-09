@@ -229,17 +229,13 @@ class BumpEngine:
                 if not matches:
                     logger.debug("SKIP filter '%s' (id=%d): keyword '%s' no matches", flt.name, flt.id, flt.keyword)
                     continue
-                # Pick oldest live lot (None expires_at = oldest priority)
-                best_live = min(matches, key=lambda l: (
-                    l.expires_at if l.expires_at is not None else datetime.min,
-                    l.playerok_id,
-                ))
                 # Determine filter cooldown from DB lots' last_bumped_at
                 all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at]
                 filter_last_bump = max(all_bumped) if all_bumped else None
                 elapsed = (now_utc - filter_last_bump).total_seconds() / 60 if filter_last_bump else float("inf")
-                filter_on_cooldown = elapsed < flt.interval_minutes
-                filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, best_live, True))
+                # Use interval-1 threshold so a 1-min filter always fires each tick
+                filter_on_cooldown = elapsed < max(0, flt.interval_minutes - 1)
+                filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, matches, True))
             else:
                 lots = [l for l in flt.lots if not l.paused]
                 if not lots:
@@ -250,7 +246,7 @@ class BumpEngine:
                     return (now_utc - l.last_bumped_at).total_seconds() / 60 if l.last_bumped_at else float("inf")
 
                 def _lot_key(l: Lot):
-                    on_cd = _elapsed(l) < flt.interval_minutes
+                    on_cd = _elapsed(l) < max(0, flt.interval_minutes - 1)
                     return (
                         on_cd,
                         l.expires_at is None,
@@ -263,7 +259,7 @@ class BumpEngine:
                 lots.sort(key=_lot_key)
                 all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
                 filter_last_bump = max(all_bumped) if all_bumped else None
-                filter_on_cooldown = _elapsed(lots[0]) < flt.interval_minutes
+                filter_on_cooldown = _elapsed(lots[0]) < max(0, flt.interval_minutes - 1)
                 filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, lots, False))
 
         if not filter_candidates:
@@ -290,8 +286,17 @@ class BumpEngine:
         logger.info("ROBIN selected: '%s' (keyword=%s) → %d lot(s)", best_flt.name, is_keyword, n)
 
         if is_keyword:
-            db_lot = await self._get_or_create_keyword_lot(best_flt.id, data)
-            return [db_lot] if db_lot else []
+            # data is the full list of matching live lots; pick the N oldest
+            sorted_matches = sorted(data, key=lambda l: (
+                l.expires_at if l.expires_at is not None else datetime.min,
+                l.playerok_id,
+            ))
+            result = []
+            for live in sorted_matches[:n]:
+                db_lot = await self._get_or_create_keyword_lot(best_flt.id, live)
+                if db_lot:
+                    result.append(db_lot)
+            return result
         else:
             return data[:n]
 
