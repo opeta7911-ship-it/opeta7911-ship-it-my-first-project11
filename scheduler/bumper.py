@@ -120,16 +120,9 @@ class BumpEngine:
         """Bump 1.5s before the predicted board refresh.
         Self-calibrates via expires_at detection; falls back to fixed interval until first detection."""
         await self._startup_done.wait()
-
-        # Wait for first board refresh detection before the very first bump.
-        # This ensures the startup bump is well-timed rather than random.
-        # Give up and bump immediately after 2 * avg_interval if nothing detected.
-        wait_deadline = datetime.utcnow().timestamp() + self._avg_refresh_interval * 2
-        while self._last_board_refresh_ts is None:
-            if datetime.utcnow().timestamp() >= wait_deadline:
-                logger.info("SMART BUMP: no detection within startup window — doing initial bump now")
-                break
-            await asyncio.sleep(3)
+        # First bump is always random-timed (no data yet).
+        # After it fires, expires_at detection calibrates within ~8s.
+        await asyncio.sleep(3)
 
         while self._enabled:
             if self._last_board_refresh_ts is not None:
