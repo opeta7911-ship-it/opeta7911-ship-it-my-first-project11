@@ -8,7 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from database.db import Database
 from database.models import BumpHistory, Cycle, Filter, Lot
-from playerok.client import MyLot, PlayerokClient
+from playerok.client import LOT_LIFETIME_DAYS, MyLot, PlayerokClient
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class BumpEngine:
         self._last_board_refresh_ts: float | None = None
         self._avg_refresh_interval: float = 62.0
         self._refresh_intervals: list[float] = []
-        self._prev_positions: dict[str, int] = {}
+        self._prev_expires: dict[str, datetime | None] = {}
 
     @property
     def enabled(self) -> bool:
@@ -51,62 +51,74 @@ class BumpEngine:
         self._startup_done.clear()
         self._last_board_refresh_ts = None
         self._refresh_intervals.clear()
-        self._prev_positions.clear()
+        self._prev_expires.clear()
         asyncio.create_task(self._startup_sync())
         self._live_lots_task = asyncio.create_task(self._live_lots_loop())
         self._smart_bump_task = asyncio.create_task(self._smart_bump_loop())
         self._task = asyncio.create_task(self._run_loop())
 
     async def _live_lots_loop(self) -> None:
-        """Polls get_my_lots() every 25s: refreshes live lots AND detects board refreshes."""
+        """Polls get_my_lots() every 25s: refreshes live lots AND detects board approvals
+        via expires_at changes (expires_at = approval_date + LOT_LIFETIME_DAYS)."""
         await self._startup_done.wait()
         if self._live_lots:
-            self._prev_positions = {l.playerok_id: l.priority_position for l in self._live_lots}
+            self._prev_expires = {l.playerok_id: l.expires_at for l in self._live_lots}
             await asyncio.sleep(25)
         while self._enabled:
             try:
                 lots = await self.playerok.get_my_lots()
-                new_pos = {l.playerok_id: l.priority_position for l in lots}
+                new_expires = {l.playerok_id: l.expires_at for l in lots}
+                now_ts = datetime.utcnow().timestamp()
+
+                # Detect board approval: when expires_at changes for any lot, Playerok
+                # updated its approval_date (= our bump was processed by the board cycle).
+                # approval_ts = expires_at - LOT_LIFETIME_DAYS  ≈  board refresh time.
+                for pid, new_exp in new_expires.items():
+                    old_exp = self._prev_expires.get(pid)
+                    if old_exp is None or new_exp is None or new_exp == old_exp:
+                        continue
+                    approval_ts = (new_exp - timedelta(days=LOT_LIFETIME_DAYS)).timestamp()
+                    # Ignore stale approvals (older than 3 min)
+                    if now_ts - approval_ts > 180:
+                        continue
+                    logger.info(
+                        "Board approval via expires_at: lot=%s approved=%.0fs ago",
+                        pid, now_ts - approval_ts,
+                    )
+                    if self._last_board_refresh_ts is not None:
+                        interval = approval_ts - self._last_board_refresh_ts
+                        if 15 < interval < 300:
+                            self._refresh_intervals.append(interval)
+                            if len(self._refresh_intervals) > 20:
+                                self._refresh_intervals.pop(0)
+                            self._avg_refresh_interval = (
+                                sum(self._refresh_intervals) / len(self._refresh_intervals)
+                            )
+                            logger.info(
+                                "Board refresh interval: %.0fs  avg=%.0fs",
+                                interval, self._avg_refresh_interval,
+                            )
+                    if self._last_board_refresh_ts is None or approval_ts > self._last_board_refresh_ts:
+                        self._last_board_refresh_ts = approval_ts
+
                 logger.info(
-                    "Live lots poll: %d lots | positions: %s",
+                    "Live lots poll: %d lots | last_approval=%s avg_interval=%.0fs",
                     len(lots),
-                    {l.name[:20]: l.priority_position for l in lots[:5]},
+                    datetime.utcfromtimestamp(self._last_board_refresh_ts).strftime("%H:%M:%S")
+                        if self._last_board_refresh_ts else "none",
+                    self._avg_refresh_interval,
                 )
 
-                # Detect board refresh: total absolute position change across all lots ≥ 2
-                if self._prev_positions:
-                    total_change = sum(
-                        abs(new_pos.get(pid, 0) - old)
-                        for pid, old in self._prev_positions.items()
-                        if pid in new_pos and old > 0 and new_pos[pid] > 0
-                    )
-                    if total_change >= 2:
-                        now_ts = datetime.utcnow().timestamp()
-                        if self._last_board_refresh_ts is not None:
-                            interval = now_ts - self._last_board_refresh_ts
-                            if 15 < interval < 300:
-                                self._refresh_intervals.append(interval)
-                                if len(self._refresh_intervals) > 20:
-                                    self._refresh_intervals.pop(0)
-                                self._avg_refresh_interval = (
-                                    sum(self._refresh_intervals) / len(self._refresh_intervals)
-                                )
-                                logger.info(
-                                    "Board refresh detected: interval=%.0fs  avg=%.0fs",
-                                    interval, self._avg_refresh_interval,
-                                )
-                        self._last_board_refresh_ts = now_ts
-
                 self._live_lots = lots
-                self._prev_positions = new_pos
+                self._prev_expires = new_expires
                 await asyncio.sleep(25)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
                 await asyncio.sleep(60)
 
     async def _smart_bump_loop(self) -> None:
-        """For top_position filters: bump 8 seconds before the predicted board refresh.
-        Falls back to a fixed interval if board refresh detection never fires."""
+        """For top_position filters: bump 3s before the predicted board refresh.
+        Falls back to a fixed interval until the first expires_at-based detection fires."""
         await self._startup_done.wait()
         # Bump immediately on startup so we enter the top right away
         await asyncio.sleep(3)
@@ -163,7 +175,7 @@ class BumpEngine:
             logger.info(
                 "SMART BUMP '%s' → %d lot(s) (avg_interval=%.0fs, detection=%s)",
                 flt.name, min(n, len(sorted_matches)), self._avg_refresh_interval,
-                "ON" if self._last_board_refresh_ts else "OFF/fixed",
+                "ON/expires_at" if self._last_board_refresh_ts else "OFF/fixed",
             )
             for live in sorted_matches[:n]:
                 db_lot = await self._get_or_create_keyword_lot(flt.id, live)
@@ -180,6 +192,7 @@ class BumpEngine:
             return
         # Populate live lots cache immediately from startup data
         self._live_lots = active
+        self._prev_expires = {l.playerok_id: l.expires_at for l in active}
         self._startup_done.set()
 
         active_ids = {a.playerok_id for a in active}
