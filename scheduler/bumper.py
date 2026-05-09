@@ -67,6 +67,11 @@ class BumpEngine:
             try:
                 lots = await self.playerok.get_my_lots()
                 new_pos = {l.playerok_id: l.priority_position for l in lots}
+                logger.debug(
+                    "Live lots poll: %d lots, positions: %s",
+                    len(lots),
+                    {l.name[:20]: l.priority_position for l in lots[:5]},
+                )
 
                 # Detect board refresh: total absolute position change across all lots ≥ 2
                 if self._prev_positions:
@@ -100,29 +105,27 @@ class BumpEngine:
                 await asyncio.sleep(60)
 
     async def _smart_bump_loop(self) -> None:
-        """For top_position filters: bump 8 seconds before the predicted board refresh."""
+        """For top_position filters: bump 8 seconds before the predicted board refresh.
+        Falls back to a fixed interval if board refresh detection never fires."""
         await self._startup_done.wait()
-        # Wait until we have at least one detected refresh to calibrate timing
-        while self._enabled and self._last_board_refresh_ts is None:
-            await asyncio.sleep(3)
+        # Give live_lots_loop time to do its first poll (25s + API latency)
+        await asyncio.sleep(30)
 
         while self._enabled:
-            if self._last_board_refresh_ts is None:
-                await asyncio.sleep(3)
-                continue
-
-            now_ts = datetime.utcnow().timestamp()
-            elapsed = now_ts - self._last_board_refresh_ts
-            time_until_next = self._avg_refresh_interval - elapsed
-            # Aim to bump 8 seconds before the predicted refresh
-            sleep_for = time_until_next - 8
-
-            if sleep_for > 0.5:
-                await asyncio.sleep(sleep_for)
-            elif sleep_for < -self._avg_refresh_interval:
-                # We've missed a full cycle — recalibrate by waiting a bit
-                await asyncio.sleep(5)
-                continue
+            if self._last_board_refresh_ts is not None:
+                # Precise timing: sleep until 8s before next predicted refresh
+                now_ts = datetime.utcnow().timestamp()
+                elapsed = now_ts - self._last_board_refresh_ts
+                sleep_for = self._avg_refresh_interval - elapsed - 8
+                if sleep_for > 1:
+                    await asyncio.sleep(sleep_for)
+            else:
+                # Board refresh never detected (priority_position always 0 from API).
+                # Fall back: bump every avg_refresh_interval on a fixed clock.
+                logger.info(
+                    "SMART BUMP: no refresh detected yet — bumping on %.0fs fixed interval",
+                    self._avg_refresh_interval,
+                )
 
             if not self._enabled:
                 break
@@ -132,8 +135,11 @@ class BumpEngine:
             except Exception:
                 logger.exception("Smart bump failed")
 
-            # Don't re-fire until the next cycle
-            await asyncio.sleep(max(5, self._avg_refresh_interval * 0.5))
+            # After bumping, wait for the next cycle
+            # If we have calibrated data use half-interval; otherwise full interval
+            wait = (self._avg_refresh_interval - 8) if self._last_board_refresh_ts is None \
+                   else max(5.0, self._avg_refresh_interval * 0.5)
+            await asyncio.sleep(wait)
 
     async def _do_smart_bumps(self) -> None:
         """Bump all top_position keyword filters (called right before predicted board refresh)."""
