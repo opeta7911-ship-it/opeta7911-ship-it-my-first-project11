@@ -30,9 +30,15 @@ class BumpEngine:
         self.on_result = on_result
         self._task: asyncio.Task | None = None
         self._live_lots_task: asyncio.Task | None = None
+        self._smart_bump_task: asyncio.Task | None = None
         self._enabled = False
-        self._live_lots: list[MyLot] = []  # refreshed in background every 3 min
+        self._live_lots: list[MyLot] = []
         self._startup_done: asyncio.Event = asyncio.Event()
+        # Board refresh timing (for smart top-position bumping)
+        self._last_board_refresh_ts: float | None = None
+        self._avg_refresh_interval: float = 70.0
+        self._refresh_intervals: list[float] = []
+        self._prev_positions: dict[str, int] = {}
 
     @property
     def enabled(self) -> bool:
@@ -43,32 +49,120 @@ class BumpEngine:
             return
         self._enabled = True
         self._startup_done.clear()
+        self._last_board_refresh_ts = None
+        self._refresh_intervals.clear()
+        self._prev_positions.clear()
         asyncio.create_task(self._startup_sync())
         self._live_lots_task = asyncio.create_task(self._live_lots_loop())
+        self._smart_bump_task = asyncio.create_task(self._smart_bump_loop())
         self._task = asyncio.create_task(self._run_loop())
 
     async def _live_lots_loop(self) -> None:
-        """Refreshes live Playerok lots in background every 90 seconds."""
+        """Polls get_my_lots() every 25s: refreshes live lots AND detects board refreshes."""
         await self._startup_done.wait()
         if self._live_lots:
-            await asyncio.sleep(90)
+            self._prev_positions = {l.playerok_id: l.priority_position for l in self._live_lots}
+            await asyncio.sleep(25)
         while self._enabled:
             try:
-                self._live_lots = await self.playerok.get_my_lots()
-                logger.debug("Live lots refreshed: %d lots", len(self._live_lots))
-                await asyncio.sleep(90)
-            except Exception as e:
-                logger.warning("Live lots refresh failed: %s — retry in 3 min", e)
-                await asyncio.sleep(180)
+                lots = await self.playerok.get_my_lots()
+                new_pos = {l.playerok_id: l.priority_position for l in lots}
 
-    async def _post_bump_refresh(self) -> None:
-        """Refresh live lots 8 seconds after a bump to get fresh priority_position data."""
-        await asyncio.sleep(8)
-        try:
-            self._live_lots = await self.playerok.get_my_lots()
-            logger.debug("Post-bump refresh: %d lots", len(self._live_lots))
-        except Exception as e:
-            logger.warning("Post-bump refresh failed: %s", e)
+                # Detect board refresh: total absolute position change across all lots ≥ 2
+                if self._prev_positions:
+                    total_change = sum(
+                        abs(new_pos.get(pid, 0) - old)
+                        for pid, old in self._prev_positions.items()
+                        if pid in new_pos and old > 0 and new_pos[pid] > 0
+                    )
+                    if total_change >= 2:
+                        now_ts = datetime.utcnow().timestamp()
+                        if self._last_board_refresh_ts is not None:
+                            interval = now_ts - self._last_board_refresh_ts
+                            if 15 < interval < 300:
+                                self._refresh_intervals.append(interval)
+                                if len(self._refresh_intervals) > 20:
+                                    self._refresh_intervals.pop(0)
+                                self._avg_refresh_interval = (
+                                    sum(self._refresh_intervals) / len(self._refresh_intervals)
+                                )
+                                logger.info(
+                                    "Board refresh detected: interval=%.0fs  avg=%.0fs",
+                                    interval, self._avg_refresh_interval,
+                                )
+                        self._last_board_refresh_ts = now_ts
+
+                self._live_lots = lots
+                self._prev_positions = new_pos
+                await asyncio.sleep(25)
+            except Exception as e:
+                logger.warning("Live lots refresh failed: %s — retry in 60s", e)
+                await asyncio.sleep(60)
+
+    async def _smart_bump_loop(self) -> None:
+        """For top_position filters: bump 8 seconds before the predicted board refresh."""
+        await self._startup_done.wait()
+        # Wait until we have at least one detected refresh to calibrate timing
+        while self._enabled and self._last_board_refresh_ts is None:
+            await asyncio.sleep(3)
+
+        while self._enabled:
+            if self._last_board_refresh_ts is None:
+                await asyncio.sleep(3)
+                continue
+
+            now_ts = datetime.utcnow().timestamp()
+            elapsed = now_ts - self._last_board_refresh_ts
+            time_until_next = self._avg_refresh_interval - elapsed
+            # Aim to bump 8 seconds before the predicted refresh
+            sleep_for = time_until_next - 8
+
+            if sleep_for > 0.5:
+                await asyncio.sleep(sleep_for)
+            elif sleep_for < -self._avg_refresh_interval:
+                # We've missed a full cycle — recalibrate by waiting a bit
+                await asyncio.sleep(5)
+                continue
+
+            if not self._enabled:
+                break
+
+            try:
+                await self._do_smart_bumps()
+            except Exception:
+                logger.exception("Smart bump failed")
+
+            # Don't re-fire until the next cycle
+            await asyncio.sleep(max(5, self._avg_refresh_interval * 0.5))
+
+    async def _do_smart_bumps(self) -> None:
+        """Bump all top_position keyword filters (called right before predicted board refresh)."""
+        now_utc = datetime.utcnow()
+        async with self.db.session_factory() as session:
+            rows = await session.execute(
+                select(Filter)
+                .where(Filter.enabled.is_(True), Filter.top_position.isnot(None))
+                .options(selectinload(Filter.lots))
+            )
+            filters = rows.scalars().all()
+
+        for flt in filters:
+            if not flt.keyword or not self._filter_has_budget(flt):
+                continue
+            kw = flt.keyword.lower()
+            matches = [l for l in self._live_lots if kw in l.name.lower()]
+            if not matches:
+                continue
+            n = flt.lots_per_trigger or 1
+            sorted_matches = self._sort_live_by_db_age(matches, flt.lots)
+            logger.info(
+                "SMART BUMP '%s' → %d lot(s) (board refresh in ~8s, avg_interval=%.0fs)",
+                flt.name, min(n, len(sorted_matches)), self._avg_refresh_interval,
+            )
+            for live in sorted_matches[:n]:
+                db_lot = await self._get_or_create_keyword_lot(flt.id, live)
+                if db_lot:
+                    await self._bump_lot(db_lot)
 
     async def _startup_sync(self) -> None:
         """On startup, sync stored lots and populate _live_lots cache."""
@@ -135,7 +229,7 @@ class BumpEngine:
 
     async def stop(self) -> None:
         self._enabled = False
-        for task in (self._task, self._live_lots_task):
+        for task in (self._task, self._live_lots_task, self._smart_bump_task):
             if task:
                 task.cancel()
                 try:
@@ -144,6 +238,7 @@ class BumpEngine:
                     pass
         self._task = None
         self._live_lots_task = None
+        self._smart_bump_task = None
 
     async def _run_loop(self) -> None:
         await self._sleep_to_next_minute()
@@ -164,82 +259,12 @@ class BumpEngine:
     async def _tick(self) -> None:
         now = datetime.now()
         now_utc = datetime.utcnow()
-
-        # Emergency position bumps — fire before normal schedule
-        emergency_lots = await self._pick_position_emergency(now_utc, self._live_lots)
-        bumped_filter_ids: set[int] = set()
-        any_bumped = False
-        for lot in emergency_lots:
-            await self._bump_lot(lot)
-            bumped_filter_ids.add(lot.filter_id)
-            any_bumped = True
-
-        # Use cached live lots — refreshed in background by _live_lots_loop
+        # top_position filters are handled by _smart_bump_loop; tick handles the rest
         lots = await self._pick_next_lots(now, now_utc, self._live_lots)
-        for lot in lots:
-            if lot.filter_id not in bumped_filter_ids:
-                await self._bump_lot(lot)
-                any_bumped = True
-        if not any_bumped:
+        if not lots:
             logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
-            return
-
-        # Refresh live lots shortly after bumping so position data is fresh
-        asyncio.create_task(self._post_bump_refresh())
-
-    async def _pick_position_emergency(self, now_utc: datetime, live_lots: list[MyLot]) -> list["Lot"]:
-        """For filters with top_position set: if any lot is outside target, bump immediately."""
-        if not live_lots:
-            return []
-        result: list[Lot] = []
-        async with self.db.session_factory() as session:
-            from sqlalchemy import select as sa_select
-            rows = await session.execute(
-                sa_select(Filter)
-                .where(Filter.enabled.is_(True), Filter.top_position.isnot(None))
-                .options(selectinload(Filter.lots))
-            )
-            filters = rows.scalars().all()
-
-        for flt in filters:
-            if not flt.keyword or not self._filter_has_budget(flt):
-                continue
-            kw = flt.keyword.lower()
-            matches = [l for l in live_lots if kw in l.name.lower()]
-            if not matches:
-                continue
-
-            # Find best (lowest) position among our matching live lots
-            best_pos = min(
-                (l.priority_position for l in matches if l.priority_position > 0),
-                default=None,
-            )
-
-            needs_bump = best_pos is None or best_pos > flt.top_position
-
-            if not needs_bump:
-                logger.debug(
-                    "POSITION '%s': pos=%d ≤ top-%d ✓", flt.name, best_pos, flt.top_position
-                )
-                continue
-
-            # Check that we haven't bumped this filter in the last 50 seconds
-            all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at]
-            last_bump = max(all_bumped) if all_bumped else None
-            if last_bump and (now_utc - last_bump).total_seconds() < 50:
-                continue
-
-            logger.info(
-                "POSITION EMERGENCY '%s': pos=%s > top-%d — bumping",
-                flt.name, best_pos, flt.top_position,
-            )
-            sorted_matches = self._sort_live_by_db_age(matches, flt.lots)
-            n = flt.lots_per_trigger or 1
-            for live in sorted_matches[:n]:
-                db_lot = await self._get_or_create_keyword_lot(flt.id, live)
-                if db_lot:
-                    result.append(db_lot)
-        return result
+        for lot in lots:
+            await self._bump_lot(lot)
 
     async def _pick_next_lots(self, now: datetime, now_utc: datetime, live_lots: list[MyLot]) -> list[Lot]:
         result: list[Lot] = []
@@ -258,6 +283,7 @@ class BumpEngine:
                 .outerjoin(Filter.cycle)
                 .where(
                     Filter.enabled.is_(True),
+                    Filter.top_position.is_(None),  # top_position filters handled by smart loop
                     or_(
                         Filter.cycle_id.is_(None),
                         Cycle.enabled.is_(False),
