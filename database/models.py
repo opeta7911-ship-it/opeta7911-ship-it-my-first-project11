@@ -34,6 +34,7 @@ class Filter(Base):
     spent_kopecks: Mapped[int] = mapped_column(Integer, default=0)
     limit_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     lots_per_trigger: Mapped[int] = mapped_column(Integer, default=1)
+    top_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

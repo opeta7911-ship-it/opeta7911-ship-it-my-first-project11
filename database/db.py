@@ -14,6 +14,7 @@ _MIGRATIONS = [
     "ALTER TABLE lots ADD COLUMN expires_at DATETIME",
     "ALTER TABLE filters ADD COLUMN keyword TEXT",
     "UPDATE filters SET limit_reset_at = NULL",
+    "ALTER TABLE filters ADD COLUMN top_position INTEGER",
 ]
 
 

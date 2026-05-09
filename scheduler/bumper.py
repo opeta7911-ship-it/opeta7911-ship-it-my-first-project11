@@ -159,12 +159,74 @@ class BumpEngine:
         now = datetime.now()
         now_utc = datetime.utcnow()
 
-        # Use cached live lots — refreshed every 60s by _live_lots_loop (no blocking API call here)
-        lots = await self._pick_next_lots(now, now_utc, self._live_lots)
-        if not lots:
-            logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
-        for lot in lots:
+        # Emergency position bumps — fire before normal schedule
+        emergency_lots = await self._pick_position_emergency(now_utc, self._live_lots)
+        bumped_filter_ids: set[int] = set()
+        for lot in emergency_lots:
             await self._bump_lot(lot)
+            bumped_filter_ids.add(lot.filter_id)
+
+        # Use cached live lots — refreshed every 3 min by _live_lots_loop
+        lots = await self._pick_next_lots(now, now_utc, self._live_lots)
+        for lot in lots:
+            if lot.filter_id not in bumped_filter_ids:
+                await self._bump_lot(lot)
+        if not emergency_lots and not lots:
+            logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
+
+    async def _pick_position_emergency(self, now_utc: datetime, live_lots: list[MyLot]) -> list["Lot"]:
+        """For filters with top_position set: if any lot is outside target, bump immediately."""
+        if not live_lots:
+            return []
+        result: list[Lot] = []
+        async with self.db.session_factory() as session:
+            from sqlalchemy import select as sa_select
+            rows = await session.execute(
+                sa_select(Filter)
+                .where(Filter.enabled.is_(True), Filter.top_position.isnot(None))
+                .options(selectinload(Filter.lots))
+            )
+            filters = rows.scalars().all()
+
+        for flt in filters:
+            if not flt.keyword or not self._filter_has_budget(flt):
+                continue
+            kw = flt.keyword.lower()
+            matches = [l for l in live_lots if kw in l.name.lower()]
+            if not matches:
+                continue
+
+            # Find best (lowest) position among our matching live lots
+            best_pos = min(
+                (l.priority_position for l in matches if l.priority_position > 0),
+                default=None,
+            )
+
+            needs_bump = best_pos is None or best_pos > flt.top_position
+
+            if not needs_bump:
+                logger.debug(
+                    "POSITION '%s': pos=%d ≤ top-%d ✓", flt.name, best_pos, flt.top_position
+                )
+                continue
+
+            # Check that we haven't emergency-bumped this filter in the last 90 seconds
+            all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at]
+            last_bump = max(all_bumped) if all_bumped else None
+            if last_bump and (now_utc - last_bump).total_seconds() < 90:
+                continue
+
+            logger.info(
+                "POSITION EMERGENCY '%s': pos=%s > top-%d — bumping",
+                flt.name, best_pos, flt.top_position,
+            )
+            sorted_matches = self._sort_live_by_db_age(matches, flt.lots)
+            n = flt.lots_per_trigger or 1
+            for live in sorted_matches[:n]:
+                db_lot = await self._get_or_create_keyword_lot(flt.id, live)
+                if db_lot:
+                    result.append(db_lot)
+        return result
 
     async def _pick_next_lots(self, now: datetime, now_utc: datetime, live_lots: list[MyLot]) -> list[Lot]:
         result: list[Lot] = []

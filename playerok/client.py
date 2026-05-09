@@ -41,6 +41,7 @@ class MyLot:
     bump_cost_kopecks: int
     bump_priority_status_id: str
     expires_at: datetime | None = None
+    priority_position: int = 0  # current position on the public board
 
     @property
     def url(self) -> str:
@@ -104,6 +105,7 @@ class PlayerokClient:
                 bump_cost_kopecks=0,
                 bump_priority_status_id="",
                 expires_at=expires,
+                priority_position=getattr(item, "priority_position", 0) or 0,
             ))
         return lots
 

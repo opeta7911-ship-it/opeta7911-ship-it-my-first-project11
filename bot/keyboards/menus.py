@@ -63,10 +63,12 @@ def filter_card(flt: Filter) -> InlineKeyboardMarkup:
         kb.button(text=f"💰 Лимит/сутки: {spent}₽/{lim}₽", callback_data=f"filter_limit:{flt.id}")
     else:
         kb.button(text="💰 Лимит/сутки: нет", callback_data=f"filter_limit:{flt.id}")
+    top_label = f"🎯 Топ-{flt.top_position}" if flt.top_position else "🎯 Топ: выкл"
+    kb.button(text=top_label, callback_data=f"filter_top:{flt.id}")
     kb.button(text="🔄 В цикл", callback_data=f"filter_cycle_assign:{flt.id}")
     kb.button(text="🗑 Удалить", callback_data=f"filter_delete:{flt.id}")
     kb.button(text="◀️ Назад", callback_data="filters")
-    kb.adjust(1, 1, 1, 2, 1, 1, 1, 1)
+    kb.adjust(1, 1, 1, 2, 1, 1, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -116,6 +118,17 @@ def lots_per_trigger_menu(flt_id: int) -> InlineKeyboardMarkup:
         kb.button(text=str(n), callback_data=f"filter_lpt_set:{flt_id}:{n}")
     kb.button(text="◀️ Назад", callback_data=f"filter:{flt_id}")
     kb.adjust(5, 1)
+    return kb.as_markup()
+
+
+def top_position_menu(flt_id: int, current: int | None) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for n in [3, 5, 10, 20]:
+        mark = " ✅" if current == n else ""
+        kb.button(text=f"Топ-{n}{mark}", callback_data=f"filter_top_set:{flt_id}:{n}")
+    kb.button(text="❌ Выключить", callback_data=f"filter_top_set:{flt_id}:0")
+    kb.button(text="◀️ Назад", callback_data=f"filter:{flt_id}")
+    kb.adjust(4, 1, 1)
     return kb.as_markup()
 
 

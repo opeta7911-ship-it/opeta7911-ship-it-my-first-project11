@@ -13,6 +13,7 @@ from bot.keyboards.menus import (
     filters_menu,
     interval_menu,
     lots_per_trigger_menu,
+    top_position_menu,
 )
 from bot.states import FilterCreate, FilterEditIntervalCustom, FilterEditKeyword, FilterEditLimit
 from database.db import Database
@@ -46,6 +47,8 @@ def _format_filter(flt: Filter) -> str:
         lines.append(f"Лимит/сутки: {flt.spent_kopecks//100}₽ / {flt.spend_limit_kopecks//100}₽{reset_info}")
     else:
         lines.append("Лимит/сутки: нет")
+    if flt.top_position:
+        lines.append(f"🎯 Держать в топ-{flt.top_position}: ВКЛ")
     if flt.cycle_id:
         lines.append(f"Цикл: #{flt.cycle_id}")
     return "\n".join(lines)
@@ -144,6 +147,37 @@ async def cb_filter_quick_toggle(call: CallbackQuery, db: Database) -> None:
             await session.commit()
     await call.answer()
     await cb_filters(call, db)
+
+
+@router.callback_query(F.data.startswith("filter_top:"))
+async def cb_filter_top(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
+    fid = int(call.data.split(":")[1])
+    async with db.session_factory() as session:
+        flt = await session.get(Filter, fid)
+        if flt is None:
+            return
+        current = flt.top_position
+    await call.message.edit_text(
+        "🎯 <b>Удерживать в топе</b>\n\n"
+        "Бот будет следить за позицией твоих лотов на доске. "
+        "Если любой лот выпадет ниже выбранной позиции — немедленный бамп вне расписания.\n\n"
+        "Позиция обновляется каждые 3 минуты из кэша лотов.",
+        reply_markup=top_position_menu(fid, current),
+    )
+
+
+@router.callback_query(F.data.startswith("filter_top_set:"))
+async def cb_filter_top_set(call: CallbackQuery, db: Database) -> None:
+    await call.answer()
+    parts = call.data.split(":")
+    fid, n = int(parts[1]), int(parts[2])
+    async with db.session_factory() as session:
+        flt = await session.get(Filter, fid)
+        if flt:
+            flt.top_position = n if n > 0 else None
+            await session.commit()
+    await _open_filter(call, db, fid)
 
 
 @router.callback_query(F.data.startswith("filter_delete:"))
