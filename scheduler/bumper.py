@@ -286,11 +286,8 @@ class BumpEngine:
         logger.info("ROBIN selected: '%s' (keyword=%s) → %d lot(s)", best_flt.name, is_keyword, n)
 
         if is_keyword:
-            # data is the full list of matching live lots; pick the N oldest
-            sorted_matches = sorted(data, key=lambda l: (
-                l.expires_at if l.expires_at is not None else datetime.min,
-                l.playerok_id,
-            ))
+            # Sort by last_bumped_at from DB so just-bumped lots rotate to back
+            sorted_matches = self._sort_live_by_db_age(data, best_flt.lots)
             result = []
             for live in sorted_matches[:n]:
                 db_lot = await self._get_or_create_keyword_lot(best_flt.id, live)
@@ -350,14 +347,12 @@ class BumpEngine:
                     cycle.name, pos_in_cycle, scheduled_flt.keyword,
                 )
                 return None
-            best_live = min(matches, key=lambda l: (
-                l.expires_at if l.expires_at is not None else datetime.min,
-                l.playerok_id,
-            ))
+            best_live = self._sort_live_by_db_age(matches, scheduled_flt.lots)[0]
             logger.info(
-                "CYCLE '%s' pos=%d — keyword '%s' → '%s' expires=%s",
+                "CYCLE '%s' pos=%d — keyword '%s' → '%s' last=%s",
                 cycle.name, pos_in_cycle, scheduled_flt.keyword, best_live.name,
-                best_live.expires_at.strftime("%d.%m") if best_live.expires_at else "?",
+                next((l.last_bumped_at.strftime("%H:%M") for l in scheduled_flt.lots
+                      if l.playerok_id == best_live.playerok_id and l.last_bumped_at), "never"),
             )
             return await self._get_or_create_keyword_lot(scheduled_flt.id, best_live)
         else:
@@ -417,10 +412,7 @@ class BumpEngine:
         filter_last_bump, best_flt, data, is_keyword = candidates[0]
 
         if is_keyword:
-            best_live = min(data, key=lambda l: (
-                l.expires_at if l.expires_at is not None else datetime.min,
-                l.playerok_id,
-            ))
+            best_live = self._sort_live_by_db_age(data, best_flt.lots)[0]
             return await self._get_or_create_keyword_lot(best_flt.id, best_live)
         else:
             return min(data, key=lambda l: (
@@ -455,6 +447,21 @@ class BumpEngine:
                     break
 
         return schedule
+
+    @staticmethod
+    def _sort_live_by_db_age(live_lots: list[MyLot], db_lots: list[Lot]) -> list[MyLot]:
+        """Sort live lots oldest-first using last_bumped_at from DB records as primary key.
+        Falls back to expires_at when a lot has never been bumped (no DB record yet)."""
+        db_bumped: dict[str, datetime] = {
+            l.playerok_id: l.last_bumped_at
+            for l in db_lots
+            if l.playerok_id and l.last_bumped_at
+        }
+        return sorted(live_lots, key=lambda l: (
+            db_bumped.get(l.playerok_id) or datetime.min,
+            l.expires_at if l.expires_at is not None else datetime.min,
+            l.playerok_id,
+        ))
 
     async def _get_or_create_keyword_lot(self, filter_id: int, live: MyLot) -> Lot | None:
         """Find or create a DB Lot record for a keyword-matched live lot."""
