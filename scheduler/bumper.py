@@ -63,7 +63,7 @@ class BumpEngine:
         await self._startup_done.wait()
         if self._live_lots:
             self._prev_expires = {l.playerok_id: l.expires_at for l in self._live_lots}
-            await asyncio.sleep(25)
+            await asyncio.sleep(8)
         while self._enabled:
             try:
                 lots = await self.playerok.get_my_lots()
@@ -111,7 +111,7 @@ class BumpEngine:
 
                 self._live_lots = lots
                 self._prev_expires = new_expires
-                await asyncio.sleep(25)
+                await asyncio.sleep(8)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
                 await asyncio.sleep(60)
@@ -120,8 +120,16 @@ class BumpEngine:
         """Bump 1.5s before the predicted board refresh.
         Self-calibrates via expires_at detection; falls back to fixed interval until first detection."""
         await self._startup_done.wait()
-        # Initial bump right away to enter the top on startup
-        await asyncio.sleep(3)
+
+        # Wait for first board refresh detection before the very first bump.
+        # This ensures the startup bump is well-timed rather than random.
+        # Give up and bump immediately after 2 * avg_interval if nothing detected.
+        wait_deadline = datetime.utcnow().timestamp() + self._avg_refresh_interval * 2
+        while self._last_board_refresh_ts is None:
+            if datetime.utcnow().timestamp() >= wait_deadline:
+                logger.info("SMART BUMP: no detection within startup window — doing initial bump now")
+                break
+            await asyncio.sleep(3)
 
         while self._enabled:
             if self._last_board_refresh_ts is not None:
