@@ -131,14 +131,24 @@ class BumpEngine:
                 elapsed = now_ts - self._last_board_refresh_ts
                 # Always target the NEXT future refresh, even if multiple cycles have passed
                 cycles_ahead = max(1, int(elapsed / interval) + 1)
-                next_refresh_ts = self._last_board_refresh_ts + cycles_ahead * interval
-                sleep_for = next_refresh_ts - now_ts - 1.5
+                # Fix the bump target BEFORE sleeping — if detection updates _last_board_refresh_ts
+                # during sleep, we still hit the originally-planned window, not the next cycle.
+                bump_target_ts = self._last_board_refresh_ts + cycles_ahead * interval - 1.5
+                sleep_for = bump_target_ts - now_ts
                 logger.info(
                     "SMART BUMP: next refresh in %.1fs (last=%.0fs ago, avg=%.0fs)",
                     sleep_for + 1.5, elapsed, interval,
                 )
-                if sleep_for > 1:
-                    await asyncio.sleep(sleep_for)
+                while sleep_for > 0.5 and self._enabled:
+                    await asyncio.sleep(min(sleep_for, 2.0))
+                    # If a new detection came in that moves target EARLIER, re-target
+                    if self._last_board_refresh_ts is not None:
+                        new_elapsed = datetime.utcnow().timestamp() - self._last_board_refresh_ts
+                        new_cycles = max(1, int(new_elapsed / self._avg_refresh_interval) + 1)
+                        new_target = self._last_board_refresh_ts + new_cycles * self._avg_refresh_interval - 1.5
+                        if new_target < bump_target_ts:
+                            bump_target_ts = new_target
+                    sleep_for = bump_target_ts - datetime.utcnow().timestamp()
             else:
                 logger.info(
                     "SMART BUMP: no refresh detected — bumping on %.0fs fixed interval",
