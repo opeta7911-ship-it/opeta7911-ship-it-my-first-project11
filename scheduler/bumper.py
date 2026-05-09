@@ -89,7 +89,7 @@ class BumpEngine:
                         interval = approval_ts - self._last_board_refresh_ts
                         if 15 < interval < 300:
                             self._refresh_intervals.append(interval)
-                            if len(self._refresh_intervals) > 20:
+                            if len(self._refresh_intervals) > 5:
                                 self._refresh_intervals.pop(0)
                             self._avg_refresh_interval = (
                                 sum(self._refresh_intervals) / len(self._refresh_intervals)
@@ -128,7 +128,7 @@ class BumpEngine:
                 # Precise timing: sleep until 3s before next predicted refresh
                 now_ts = datetime.utcnow().timestamp()
                 elapsed = now_ts - self._last_board_refresh_ts
-                sleep_for = self._avg_refresh_interval - elapsed - 3
+                sleep_for = self._avg_refresh_interval - elapsed - 1.5
                 if sleep_for > 1:
                     await asyncio.sleep(sleep_for)
             else:
@@ -148,7 +148,7 @@ class BumpEngine:
                 logger.exception("Smart bump failed")
 
             # Wait for next cycle (leave 3s margin again on the other side)
-            wait = (self._avg_refresh_interval - 3) if self._last_board_refresh_ts is None \
+            wait = (self._avg_refresh_interval - 1.5) if self._last_board_refresh_ts is None \
                    else max(5.0, self._avg_refresh_interval * 0.5)
             await asyncio.sleep(wait)
 
