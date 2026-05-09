@@ -134,6 +134,18 @@ async def cb_filter_toggle(call: CallbackQuery, db: Database) -> None:
     await _open_filter(call, db, fid)
 
 
+@router.callback_query(F.data.startswith("filter_quick_toggle:"))
+async def cb_filter_quick_toggle(call: CallbackQuery, db: Database) -> None:
+    fid = int(call.data.split(":")[1])
+    async with db.session_factory() as session:
+        flt = await session.get(Filter, fid)
+        if flt:
+            flt.enabled = not flt.enabled
+            await session.commit()
+    await call.answer()
+    await cb_filters(call, db)
+
+
 @router.callback_query(F.data.startswith("filter_delete:"))
 async def cb_filter_delete(call: CallbackQuery, db: Database) -> None:
     await call.answer("Удалено")
