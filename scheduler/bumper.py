@@ -108,22 +108,22 @@ class BumpEngine:
         """For top_position filters: bump 8 seconds before the predicted board refresh.
         Falls back to a fixed interval if board refresh detection never fires."""
         await self._startup_done.wait()
-        # Give live_lots_loop time to do its first poll (25s + API latency)
-        await asyncio.sleep(30)
+        # Bump immediately on startup so we enter the top right away
+        await asyncio.sleep(3)
 
         while self._enabled:
             if self._last_board_refresh_ts is not None:
-                # Precise timing: sleep until 8s before next predicted refresh
+                # Precise timing: sleep until 3s before next predicted refresh
                 now_ts = datetime.utcnow().timestamp()
                 elapsed = now_ts - self._last_board_refresh_ts
-                sleep_for = self._avg_refresh_interval - elapsed - 8
+                sleep_for = self._avg_refresh_interval - elapsed - 3
                 if sleep_for > 1:
                     await asyncio.sleep(sleep_for)
             else:
                 # Board refresh never detected (priority_position always 0 from API).
                 # Fall back: bump every avg_refresh_interval on a fixed clock.
                 logger.info(
-                    "SMART BUMP: no refresh detected yet — bumping on %.0fs fixed interval",
+                    "SMART BUMP: no refresh detected — bumping on %.0fs fixed interval",
                     self._avg_refresh_interval,
                 )
 
@@ -135,9 +135,8 @@ class BumpEngine:
             except Exception:
                 logger.exception("Smart bump failed")
 
-            # After bumping, wait for the next cycle
-            # If we have calibrated data use half-interval; otherwise full interval
-            wait = (self._avg_refresh_interval - 8) if self._last_board_refresh_ts is None \
+            # Wait for next cycle (leave 3s margin again on the other side)
+            wait = (self._avg_refresh_interval - 3) if self._last_board_refresh_ts is None \
                    else max(5.0, self._avg_refresh_interval * 0.5)
             await asyncio.sleep(wait)
 
