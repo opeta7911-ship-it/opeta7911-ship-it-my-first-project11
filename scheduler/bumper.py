@@ -117,23 +117,28 @@ class BumpEngine:
                 await asyncio.sleep(60)
 
     async def _smart_bump_loop(self) -> None:
-        """For top_position filters: bump 3s before the predicted board refresh.
-        Falls back to a fixed interval until the first expires_at-based detection fires."""
+        """Bump 1.5s before the predicted board refresh.
+        Self-calibrates via expires_at detection; falls back to fixed interval until first detection."""
         await self._startup_done.wait()
-        # Bump immediately on startup so we enter the top right away
+        # Initial bump right away to enter the top on startup
         await asyncio.sleep(3)
 
         while self._enabled:
             if self._last_board_refresh_ts is not None:
-                # Precise timing: sleep until 3s before next predicted refresh
                 now_ts = datetime.utcnow().timestamp()
+                interval = self._avg_refresh_interval
                 elapsed = now_ts - self._last_board_refresh_ts
-                sleep_for = self._avg_refresh_interval - elapsed - 1.5
+                # Always target the NEXT future refresh, even if multiple cycles have passed
+                cycles_ahead = max(1, int(elapsed / interval) + 1)
+                next_refresh_ts = self._last_board_refresh_ts + cycles_ahead * interval
+                sleep_for = next_refresh_ts - now_ts - 1.5
+                logger.info(
+                    "SMART BUMP: next refresh in %.1fs (last=%.0fs ago, avg=%.0fs)",
+                    sleep_for + 1.5, elapsed, interval,
+                )
                 if sleep_for > 1:
                     await asyncio.sleep(sleep_for)
             else:
-                # Board refresh never detected (priority_position always 0 from API).
-                # Fall back: bump every avg_refresh_interval on a fixed clock.
                 logger.info(
                     "SMART BUMP: no refresh detected — bumping on %.0fs fixed interval",
                     self._avg_refresh_interval,
@@ -147,10 +152,9 @@ class BumpEngine:
             except Exception:
                 logger.exception("Smart bump failed")
 
-            # Wait for next cycle (leave 3s margin again on the other side)
-            wait = (self._avg_refresh_interval - 1.5) if self._last_board_refresh_ts is None \
-                   else max(5.0, self._avg_refresh_interval * 0.5)
-            await asyncio.sleep(wait)
+            # Sleep enough to avoid double-bumping in the same refresh window,
+            # but short enough to recalculate timing precisely next iteration
+            await asyncio.sleep(max(5.0, self._avg_refresh_interval * 0.6))
 
     async def _do_smart_bumps(self) -> None:
         """Bump all top_position keyword filters (called right before predicted board refresh)."""
