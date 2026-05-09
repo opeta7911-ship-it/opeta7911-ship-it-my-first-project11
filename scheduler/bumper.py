@@ -283,6 +283,9 @@ class BumpEngine:
         )
 
         filter_on_cooldown, filter_last_bump, best_flt, data, is_keyword = filter_candidates[0]
+        if filter_on_cooldown:
+            logger.debug("ROBIN: best candidate '%s' is on cooldown, skipping", best_flt.name)
+            return []
         n = best_flt.lots_per_trigger or 1
         logger.info("ROBIN selected: '%s' (keyword=%s) → %d lot(s)", best_flt.name, is_keyword, n)
 
