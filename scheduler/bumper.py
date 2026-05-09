@@ -36,7 +36,7 @@ class BumpEngine:
         self._startup_done: asyncio.Event = asyncio.Event()
         # Board refresh timing (for smart top-position bumping)
         self._last_board_refresh_ts: float | None = None
-        self._avg_refresh_interval: float = 70.0
+        self._avg_refresh_interval: float = 62.0
         self._refresh_intervals: list[float] = []
         self._prev_positions: dict[str, int] = {}
 
@@ -67,8 +67,8 @@ class BumpEngine:
             try:
                 lots = await self.playerok.get_my_lots()
                 new_pos = {l.playerok_id: l.priority_position for l in lots}
-                logger.debug(
-                    "Live lots poll: %d lots, positions: %s",
+                logger.info(
+                    "Live lots poll: %d lots | positions: %s",
                     len(lots),
                     {l.name[:20]: l.priority_position for l in lots[:5]},
                 )
@@ -161,8 +161,9 @@ class BumpEngine:
             n = flt.lots_per_trigger or 1
             sorted_matches = self._sort_live_by_db_age(matches, flt.lots)
             logger.info(
-                "SMART BUMP '%s' → %d lot(s) (board refresh in ~8s, avg_interval=%.0fs)",
+                "SMART BUMP '%s' → %d lot(s) (avg_interval=%.0fs, detection=%s)",
                 flt.name, min(n, len(sorted_matches)), self._avg_refresh_interval,
+                "ON" if self._last_board_refresh_ts else "OFF/fixed",
             )
             for live in sorted_matches[:n]:
                 db_lot = await self._get_or_create_keyword_lot(flt.id, live)
