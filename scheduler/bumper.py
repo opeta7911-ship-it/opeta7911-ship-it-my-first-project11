@@ -113,7 +113,18 @@ class BumpEngine:
 
                 self._live_lots = lots
                 self._prev_expires = new_expires
-                await asyncio.sleep(10)
+                # Adaptive poll: 2s when within 15s of predicted refresh,
+                # 10s otherwise. Reduces detection lag for early refreshes
+                # without spamming the API outside the critical window.
+                poll_sleep = 10.0
+                if self._last_board_refresh_ts is not None:
+                    now_ts = datetime.utcnow().timestamp()
+                    elapsed = now_ts - self._last_board_refresh_ts
+                    time_in_cycle = elapsed % self._avg_refresh_interval
+                    time_to_next = self._avg_refresh_interval - time_in_cycle
+                    if time_to_next < 15:
+                        poll_sleep = 2.0
+                await asyncio.sleep(poll_sleep)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
                 await asyncio.sleep(60)
@@ -145,12 +156,13 @@ class BumpEngine:
         await asyncio.sleep(3)
 
         while self._enabled:
-            # Margin: last lot bumped ~2s before refresh.
-            # 2s gives enough buffer for refresh-interval variance (±2s)
-            # so we never accidentally bump AFTER a refresh.
-            # Formula: (N-1) × 1.5s API overhead + 2s buffer.
+            # Margin: last lot bumped ~3s before refresh.
+            # Refresh-interval variance observed in logs reaches ±3s
+            # (59s..65s while avg=62s). 3s buffer ensures we never bump
+            # AFTER a refresh even when it comes early.
+            # Formula: (N-1) × 1.5s API overhead + 3s buffer.
             n_lots = await self._estimate_smart_bump_count()
-            margin = max(2.0, (n_lots - 1) * 1.5 + 2.0)
+            margin = max(3.0, (n_lots - 1) * 1.5 + 3.0)
 
             if self._last_board_refresh_ts is not None:
                 now_ts = datetime.utcnow().timestamp()
