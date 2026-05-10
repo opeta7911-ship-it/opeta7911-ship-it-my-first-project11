@@ -160,7 +160,7 @@ class PlayerokClient:
             await asyncio.to_thread(account.publish_item, playerok_id, cheapest.id)
         return int(cheapest.price * 100)
 
-
+    async def refresh_bump_cost(self, playerok_id: str, price_rub: float) -> tuple[int, str]:
         async with self._lock:
             account = await self._ensure_account()
             statuses = await asyncio.to_thread(
