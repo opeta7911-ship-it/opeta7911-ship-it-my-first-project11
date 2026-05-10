@@ -318,6 +318,25 @@ class BumpEngine:
         lots = await self._pick_next_lots(now, now_utc, self._live_lots)
         if not lots:
             logger.debug("TICK %s — no lot selected", now.strftime("%H:%M"))
+            return
+
+        # Smart timing for cycle/independent lots: delay bump to just before the
+        # next board refresh (same 5s-margin logic as _smart_bump_loop).
+        # Cap at 55s so we never bleed into the next minute's tick window.
+        if self._last_board_refresh_ts is not None:
+            now_ts = datetime.utcnow().timestamp()
+            interval = self._avg_refresh_interval
+            elapsed = now_ts - self._last_board_refresh_ts
+            cycles_ahead = max(1, int(elapsed / interval) + 1)
+            target_ts = self._last_board_refresh_ts + cycles_ahead * interval - 5.0
+            sleep_for = target_ts - now_ts
+            if 0.5 < sleep_for <= 55.0:
+                logger.info(
+                    "CYCLE BUMP %s: waiting %.1fs for board refresh (avg=%.0fs)",
+                    now.strftime("%H:%M"), sleep_for, interval,
+                )
+                await asyncio.sleep(sleep_for)
+
         for lot in lots:
             await self._bump_lot(lot)
 
