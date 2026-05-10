@@ -183,10 +183,25 @@ class BumpEngine:
 
                     sleep_for = bump_target_ts - now_ts
             else:
+                # No board refresh data yet — wait the full interval BEFORE bumping
+                # to prevent rapid-fire bumps every 15s on fresh start.
+                interval_wait = self._avg_refresh_interval
                 logger.info(
-                    "SMART BUMP: no refresh detected — bumping on %.0fs fixed interval",
-                    self._avg_refresh_interval,
+                    "SMART BUMP: no refresh detected — waiting %.0fs before bump",
+                    interval_wait,
                 )
+                detection_fired = False
+                waited = 0.0
+                while waited < interval_wait and self._enabled:
+                    await asyncio.sleep(2.0)
+                    waited += 2.0
+                    if self._last_board_refresh_ts is not None:
+                        # Detection fired — skip this bump, next iteration uses smart timing
+                        logger.info("SMART BUMP: detection fired during wait — switching to smart timing")
+                        detection_fired = True
+                        break
+                if detection_fired:
+                    continue  # restart loop with smart timing
 
             if not self._enabled:
                 break
