@@ -41,7 +41,11 @@ def filters_menu(filters: list[Filter]) -> InlineKeyboardMarkup:
             text=flag,
             callback_data=f"filter_quick_toggle:{f.id}",
         )
-    kb.button(text="⛔ Выключить все", callback_data="filters_disable_all")
+    any_enabled = any(f.enabled for f in filters)
+    if any_enabled:
+        kb.button(text="⛔ Выключить все", callback_data="filters_toggle_all:0")
+    else:
+        kb.button(text="✅ Включить все", callback_data="filters_toggle_all:1")
     kb.button(text="➕ Создать фильтр", callback_data="filter_create")
     kb.button(text="◀️ Назад", callback_data="back_main")
     kb.adjust(*([2] * len(filters)), 1, 1, 1)

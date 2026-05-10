@@ -455,14 +455,16 @@ async def cb_filter_logs(call: CallbackQuery, db: Database) -> None:
         pass
 
 
-@router.callback_query(F.data == "filters_disable_all")
-async def cb_filters_disable_all(call: CallbackQuery, db: Database) -> None:
-    await call.answer("⛔ Все фильтры выключены")
+@router.callback_query(F.data.startswith("filters_toggle_all:"))
+async def cb_filters_toggle_all(call: CallbackQuery, db: Database) -> None:
+    enable = call.data.split(":")[1] == "1"
     async with db.session_factory() as session:
-        await session.execute(update(Filter).values(enabled=False))
+        await session.execute(update(Filter).values(enabled=enable))
         await session.commit()
         result = await session.execute(select(Filter).order_by(Filter.order_index, Filter.id))
         flts = result.scalars().all()
+    msg = "✅ Все фильтры включены" if enable else "⛔ Все фильтры выключены"
+    await call.answer(msg)
     await call.message.edit_reply_markup(reply_markup=filters_menu(flts))
 
 
