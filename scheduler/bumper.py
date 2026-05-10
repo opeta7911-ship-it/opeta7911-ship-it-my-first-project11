@@ -140,11 +140,11 @@ class BumpEngine:
         await asyncio.sleep(3)
 
         while self._enabled:
-            # Adaptive margin: last lot lands ~0.5s before refresh.
-            # Formula: (N-1) lots × 1.2s API overhead + 0.5s final margin.
-            # n=1 → 0.5s, n=2 → 1.7s, n=3 → 2.9s — minimises competitor window.
+            # Adaptive margin: last lot lands ~0.3s before refresh = last in queue.
+            # Formula: (N-1) lots × 1.2s API overhead + 0.3s final margin.
+            # n=1 → 0.3s, n=2 → 1.5s, n=3 → 2.7s — minimises competitor window.
             n_lots = await self._estimate_smart_bump_count()
-            margin = max(0.5, (n_lots - 1) * 1.2 + 0.5)
+            margin = max(0.3, (n_lots - 1) * 1.2 + 0.3)
 
             if self._last_board_refresh_ts is not None:
                 now_ts = datetime.utcnow().timestamp()
@@ -215,9 +215,9 @@ class BumpEngine:
             await asyncio.sleep(max(5.0, self._avg_refresh_interval * 0.25))
 
     async def _do_smart_bumps(self) -> None:
-        """Bump only top_position lots that have FALLEN BELOW the threshold.
-        Lots already in top-N are skipped to save money — this is the
-        'удерживать в топе' contract (bump only when position drops)."""
+        """Bump every top_position keyword filter at end of cycle (last in queue → first in row).
+        We always bump regardless of cached priority_position because position data
+        from get_my_lots is server-cached and often stale by several minutes."""
         now_utc = datetime.utcnow()
         async with self.db.session_factory() as session:
             rows = await session.execute(
@@ -234,27 +234,11 @@ class BumpEngine:
             matches = [l for l in self._live_lots if kw in l.name.lower()]
             if not matches:
                 continue
-
-            threshold = flt.top_position
-            # Position 0 = unknown (not yet ranked) → treat as "out of top" and bump.
-            # Position 1..threshold = inside top → already winning, skip.
-            # Position > threshold = fell out of top → bump.
-            out_of_top = [
-                l for l in matches
-                if l.priority_position == 0 or l.priority_position > threshold
-            ]
-            if not out_of_top:
-                logger.info(
-                    "SMART BUMP '%s': all %d lot(s) already in top-%d — skip",
-                    flt.name, len(matches), threshold,
-                )
-                continue
-
             n = flt.lots_per_trigger or 1
-            sorted_matches = self._sort_live_by_db_age(out_of_top, flt.lots)
+            sorted_matches = self._sort_live_by_db_age(matches, flt.lots)
             logger.info(
-                "SMART BUMP '%s' → %d/%d out-of-top lot(s) (top-%d, avg=%.0fs, detection=%s)",
-                flt.name, min(n, len(sorted_matches)), len(out_of_top), threshold,
+                "SMART BUMP '%s' → %d lot(s) (top-%d, avg=%.0fs, detection=%s)",
+                flt.name, min(n, len(sorted_matches)), flt.top_position,
                 self._avg_refresh_interval,
                 "ON/expires_at" if self._last_board_refresh_ts else "OFF/fixed",
             )
