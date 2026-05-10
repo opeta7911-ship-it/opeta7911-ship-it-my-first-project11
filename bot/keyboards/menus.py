@@ -18,13 +18,14 @@ def main_menu(running: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     label = "⏸ Автоподнятие: ВКЛ" if running else "▶️ Автоподнятие: ВЫКЛ"
     kb.button(text=label, callback_data="toggle_engine")
+    kb.button(text="🔁 Авто восстановление", callback_data="restore")
     kb.button(text="🎛 Фильтры", callback_data="filters")
     kb.button(text="📊 Статистика", callback_data="stats")
     kb.button(text="📜 История", callback_data="history")
     kb.button(text="⚙️ Настройки", callback_data="settings")
     kb.button(text="🔄 Циклы", callback_data="cycles")
     kb.button(text="🗑 Сброс", callback_data="reset_request")
-    kb.adjust(1, 2, 2, 1, 1)
+    kb.adjust(1, 1, 2, 2, 1, 1)
     return kb.as_markup()
 
 

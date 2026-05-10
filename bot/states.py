@@ -29,3 +29,7 @@ class CycleEditDuration(StatesGroup):
 
 class FilterEditKeyword(StatesGroup):
     waiting_for_keyword = State()
+
+
+class RestoreAddExclude(StatesGroup):
+    waiting_for_keyword = State()

@@ -122,7 +122,44 @@ class PlayerokClient:
         cheapest = min(statuses, key=lambda s: s.price)
         return int(cheapest.price * 100), cheapest.id
 
-    async def refresh_bump_cost(self, playerok_id: str, price_rub: float) -> tuple[int, str]:
+    def _fetch_sold_lots_sync(self, account: Account) -> list:
+        from playerokapi.enums import ItemStatuses as _S
+        page = account.get_my_items(statuses=[_S.SOLD], count=24)
+        return page.items
+
+    async def get_sold_lots(self) -> list[MyLot]:
+        """Возвращает проданные лоты (последние 24)."""
+        async with self._lock:
+            account = await self._ensure_account()
+            raw_items = await asyncio.to_thread(self._fetch_sold_lots_sync, account)
+        lots = []
+        for item in raw_items:
+            raw_price = getattr(item, "raw_price", None) or item.price
+            lots.append(MyLot(
+                playerok_id=item.id,
+                slug=item.slug,
+                name=item.name,
+                price_kopecks=int(item.price * 100),
+                bump_cost_kopecks=0,
+                bump_priority_status_id="",
+                raw_price_kopecks=int(raw_price * 100),
+            ))
+        return lots
+
+    async def republish_lot(self, playerok_id: str, price_rub: float) -> int:
+        """Переопубликовывает проданный лот. Возвращает стоимость в копейках."""
+        async with self._lock:
+            account = await self._ensure_account()
+            statuses = await asyncio.to_thread(
+                account.get_item_priority_statuses, playerok_id, price_rub
+            )
+        cheapest = min(statuses, key=lambda s: s.price)
+        async with self._lock:
+            account = await self._ensure_account()
+            await asyncio.to_thread(account.publish_item, playerok_id, cheapest.id)
+        return int(cheapest.price * 100)
+
+
         async with self._lock:
             account = await self._ensure_account()
             statuses = await asyncio.to_thread(
