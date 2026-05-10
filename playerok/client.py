@@ -42,6 +42,7 @@ class MyLot:
     bump_priority_status_id: str
     expires_at: datetime | None = None
     priority_position: int = 0  # current position on the public board
+    raw_price_kopecks: int = 0  # pre-discount price; needed for get_item_priority_statuses
 
     @property
     def url(self) -> str:
@@ -97,6 +98,7 @@ class PlayerokClient:
         for item in raw_items:
             approval_dt = _parse_dt(getattr(item, "approval_date", None))
             expires = (approval_dt + timedelta(days=LOT_LIFETIME_DAYS)) if approval_dt else None
+            raw_price = getattr(item, "raw_price", None) or item.price
             lots.append(MyLot(
                 playerok_id=item.id,
                 slug=item.slug,
@@ -106,6 +108,7 @@ class PlayerokClient:
                 bump_priority_status_id="",
                 expires_at=expires,
                 priority_position=getattr(item, "priority_position", 0) or 0,
+                raw_price_kopecks=int(raw_price * 100),
             ))
         return lots
 
@@ -118,9 +121,6 @@ class PlayerokClient:
             )
         cheapest = min(statuses, key=lambda s: s.price)
         return int(cheapest.price * 100), cheapest.id
-        return await asyncio.to_thread(
-            account.get_item_priority_statuses, item_id, price
-        )
 
     async def refresh_bump_cost(self, playerok_id: str, price_rub: float) -> tuple[int, str]:
         async with self._lock:

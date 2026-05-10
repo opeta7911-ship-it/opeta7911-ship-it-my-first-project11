@@ -678,10 +678,20 @@ class BumpEngine:
 
     _SOLD_PHRASES = ("нельзя обновить статус", "item not found", "не найден")
 
+    def _price_rub_for_bump(self, playerok_id: str, fallback_kopecks: int) -> float:
+        """Return the raw (pre-discount) price in rubles for get_item_priority_statuses.
+        Playerok validates boosters against rawPrice; using the discounted price causes
+        'некорректных бустеров' errors for discounted lots."""
+        live = next((l for l in self._live_lots if l.playerok_id == playerok_id), None)
+        if live and live.raw_price_kopecks > 0:
+            return live.raw_price_kopecks / 100
+        return fallback_kopecks / 100
+
     async def _bump_lot(self, lot: Lot) -> None:
+        price_rub = self._price_rub_for_bump(lot.playerok_id, lot.price_kopecks)
         try:
             cost, status_id = await self.playerok.refresh_bump_cost(
-                lot.playerok_id, lot.price_kopecks / 100
+                lot.playerok_id, price_rub
             )
         except Exception as exc:
             err = str(exc)
@@ -696,9 +706,10 @@ class BumpEngine:
                             await session.commit()
                     return
                 lot = refreshed
+                price_rub = self._price_rub_for_bump(lot.playerok_id, lot.price_kopecks)
                 try:
                     cost, status_id = await self.playerok.refresh_bump_cost(
-                        lot.playerok_id, lot.price_kopecks / 100
+                        lot.playerok_id, price_rub
                     )
                 except Exception as exc2:
                     await self._record_failure(lot.id, str(exc2))
