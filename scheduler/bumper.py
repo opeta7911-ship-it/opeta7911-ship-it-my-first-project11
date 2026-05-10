@@ -113,22 +113,37 @@ class BumpEngine:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
                 await asyncio.sleep(60)
 
-    async def _smart_bump_loop(self) -> None:
-        """Bump 1.5s before the predicted board refresh.
-        Self-calibrates via expires_at detection; falls back to fixed interval until first detection."""
-        await self._startup_done.wait()
-        # First bump is always random-timed (no data yet).
-        # After it fires, expires_at detection calibrates within ~8s.
-        await asyncio.sleep(3)
+    async def _estimate_smart_bump_count(self) -> int:
+        """Count how many lots will be bumped in the next smart cycle.
+        Used to adjust pre-refresh margin: each API call takes ~1.5s, so N lots
+        need N*1.5s lead time to ensure the LAST lot lands 2s before the refresh."""
+        async with self.db.session_factory() as session:
+            rows = await session.execute(
+                select(Filter).where(Filter.enabled.is_(True), Filter.top_position.isnot(None))
+            )
+            filters = rows.scalars().all()
+        total = 0
+        for flt in filters:
+            if not flt.keyword or not self._filter_has_budget(flt):
+                continue
+            kw = flt.keyword.lower()
+            n = flt.lots_per_trigger or 1
+            matches = sum(1 for l in self._live_lots if kw in l.name.lower())
+            total += min(n, matches)
+        return max(1, total)
 
     async def _smart_bump_loop(self) -> None:
-        """Bump ~5s before the predicted board refresh.
-        Self-calibrates via expires_at detection; falls back to fixed interval until first detection."""
+        """Bump just before the predicted board refresh.
+        Margin adapts to lots_per_trigger: N lots × 1.5s/lot so the LAST lot
+        lands ~2s before the refresh — minimising the window for competitors.
+        Self-calibrates via expires_at detection; falls back to fixed interval."""
         await self._startup_done.wait()
         await asyncio.sleep(3)
 
         while self._enabled:
-            margin = 5.0  # seconds before predicted refresh to bump
+            # Adaptive margin: last lot bumped ~2s before refresh
+            n_lots = await self._estimate_smart_bump_count()
+            margin = max(2.0, n_lots * 1.5)
 
             if self._last_board_refresh_ts is not None:
                 now_ts = datetime.utcnow().timestamp()
@@ -136,13 +151,12 @@ class BumpEngine:
                 elapsed = now_ts - self._last_board_refresh_ts
                 cycles_ahead = max(1, int(elapsed / interval) + 1)
                 bump_target_ts = self._last_board_refresh_ts + cycles_ahead * interval - margin
-                # Track which refresh we built this target from, to detect mid-sleep updates
                 baseline_refresh_ts = self._last_board_refresh_ts
 
                 sleep_for = bump_target_ts - now_ts
                 logger.info(
-                    "SMART BUMP: next refresh in %.1fs (last=%.0fs ago, avg=%.0fs)",
-                    sleep_for + margin, elapsed, interval,
+                    "SMART BUMP: next refresh in %.1fs (last=%.0fs ago, avg=%.0fs, lots=%d, margin=%.1fs)",
+                    sleep_for + margin, elapsed, interval, n_lots, margin,
                 )
 
                 while sleep_for > 0.5 and self._enabled:
@@ -156,13 +170,10 @@ class BumpEngine:
                         new_target = self._last_board_refresh_ts + new_cycles * new_iv - margin
 
                         if new_target < bump_target_ts:
-                            # Board refreshing sooner than expected — move target earlier
                             bump_target_ts = new_target
                         elif (self._last_board_refresh_ts > baseline_refresh_ts
                               and bump_target_ts > self._last_board_refresh_ts
                               and new_target > now_ts + 1):
-                            # Board refreshed during sleep (new detection), current target is now
-                            # too early in the new cycle — retarget to 5s before next refresh
                             bump_target_ts = new_target
                             baseline_refresh_ts = self._last_board_refresh_ts
                             logger.info(
@@ -185,7 +196,6 @@ class BumpEngine:
             except Exception:
                 logger.exception("Smart bump failed")
 
-            # Short post-bump sleep so we recalculate timing quickly after detection fires
             await asyncio.sleep(max(5.0, self._avg_refresh_interval * 0.25))
 
     async def _do_smart_bumps(self) -> None:
