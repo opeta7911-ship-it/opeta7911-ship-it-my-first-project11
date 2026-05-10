@@ -108,15 +108,14 @@ class BumpEngine:
 
                 self._live_lots = lots
                 self._prev_expires = new_expires
-                await asyncio.sleep(8)
+                await asyncio.sleep(5)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
                 await asyncio.sleep(60)
 
     async def _estimate_smart_bump_count(self) -> int:
         """Count how many lots will be bumped in the next smart cycle.
-        Used to adjust pre-refresh margin: each API call takes ~1.5s, so N lots
-        need N*1.5s lead time to ensure the LAST lot lands 2s before the refresh."""
+        Used to compute pre-refresh margin so the LAST lot lands ~0.5s before refresh."""
         async with self.db.session_factory() as session:
             rows = await session.execute(
                 select(Filter).where(Filter.enabled.is_(True), Filter.top_position.isnot(None))
@@ -141,9 +140,11 @@ class BumpEngine:
         await asyncio.sleep(3)
 
         while self._enabled:
-            # Adaptive margin: last lot bumped ~2s before refresh
+            # Adaptive margin: last lot lands ~0.5s before refresh.
+            # Formula: (N-1) lots × 1.2s API overhead + 0.5s final margin.
+            # n=1 → 0.5s, n=2 → 1.7s, n=3 → 2.9s — minimises competitor window.
             n_lots = await self._estimate_smart_bump_count()
-            margin = max(2.0, n_lots * 1.5)
+            margin = max(0.5, (n_lots - 1) * 1.2 + 0.5)
 
             if self._last_board_refresh_ts is not None:
                 now_ts = datetime.utcnow().timestamp()
