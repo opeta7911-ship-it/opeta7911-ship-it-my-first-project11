@@ -91,14 +91,25 @@ class BumpEngine:
                     if self._last_board_refresh_ts is not None:
                         interval = approval_ts - self._last_board_refresh_ts
                         if 15 < interval < 300:
-                            # EMA (α=0.4): adapts within 3-4 samples when interval changes
+                            # Detect missed detections (e.g. after rate-limit gap):
+                            # if the gap is much longer than expected, treat it as
+                            # multiple cycles and feed the per-cycle value to EMA.
+                            n_cycles = max(1, round(interval / self._avg_refresh_interval))
+                            effective = interval / n_cycles
+                            # EMA (α=0.4): adapts within 3-4 samples
                             self._avg_refresh_interval = (
-                                0.4 * interval + 0.6 * self._avg_refresh_interval
+                                0.4 * effective + 0.6 * self._avg_refresh_interval
                             )
-                            logger.info(
-                                "Board refresh interval: %.0fs  avg=%.0fs",
-                                interval, self._avg_refresh_interval,
-                            )
+                            if n_cycles > 1:
+                                logger.info(
+                                    "Board refresh interval: %.0fs (%d cycles → %.1fs each) avg=%.0fs",
+                                    interval, n_cycles, effective, self._avg_refresh_interval,
+                                )
+                            else:
+                                logger.info(
+                                    "Board refresh interval: %.0fs  avg=%.0fs",
+                                    interval, self._avg_refresh_interval,
+                                )
                     if self._last_board_refresh_ts is None or approval_ts > self._last_board_refresh_ts:
                         self._last_board_refresh_ts = approval_ts
                         self._refresh_detected.set()  # wake smart_bump_loop immediately
@@ -113,17 +124,17 @@ class BumpEngine:
 
                 self._live_lots = lots
                 self._prev_expires = new_expires
-                # Adaptive poll: 2s when within 15s of predicted refresh,
-                # 10s otherwise. Reduces detection lag for early refreshes
-                # without spamming the API outside the critical window.
-                poll_sleep = 10.0
+                # Adaptive poll: 4s when within 12s of predicted refresh,
+                # 12s otherwise. 4s is fast enough to catch early refreshes
+                # while staying well under Playerok's rate limit.
+                poll_sleep = 12.0
                 if self._last_board_refresh_ts is not None:
                     now_ts = datetime.utcnow().timestamp()
                     elapsed = now_ts - self._last_board_refresh_ts
                     time_in_cycle = elapsed % self._avg_refresh_interval
                     time_to_next = self._avg_refresh_interval - time_in_cycle
-                    if time_to_next < 15:
-                        poll_sleep = 2.0
+                    if time_to_next < 12:
+                        poll_sleep = 4.0
                 await asyncio.sleep(poll_sleep)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
