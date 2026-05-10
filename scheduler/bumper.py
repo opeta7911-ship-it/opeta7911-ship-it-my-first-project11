@@ -108,7 +108,7 @@ class BumpEngine:
 
                 self._live_lots = lots
                 self._prev_expires = new_expires
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
                 await asyncio.sleep(60)
@@ -215,7 +215,9 @@ class BumpEngine:
             await asyncio.sleep(max(5.0, self._avg_refresh_interval * 0.25))
 
     async def _do_smart_bumps(self) -> None:
-        """Bump all top_position keyword filters (called right before predicted board refresh)."""
+        """Bump only top_position lots that have FALLEN BELOW the threshold.
+        Lots already in top-N are skipped to save money — this is the
+        'удерживать в топе' contract (bump only when position drops)."""
         now_utc = datetime.utcnow()
         async with self.db.session_factory() as session:
             rows = await session.execute(
@@ -232,11 +234,28 @@ class BumpEngine:
             matches = [l for l in self._live_lots if kw in l.name.lower()]
             if not matches:
                 continue
+
+            threshold = flt.top_position
+            # Position 0 = unknown (not yet ranked) → treat as "out of top" and bump.
+            # Position 1..threshold = inside top → already winning, skip.
+            # Position > threshold = fell out of top → bump.
+            out_of_top = [
+                l for l in matches
+                if l.priority_position == 0 or l.priority_position > threshold
+            ]
+            if not out_of_top:
+                logger.info(
+                    "SMART BUMP '%s': all %d lot(s) already in top-%d — skip",
+                    flt.name, len(matches), threshold,
+                )
+                continue
+
             n = flt.lots_per_trigger or 1
-            sorted_matches = self._sort_live_by_db_age(matches, flt.lots)
+            sorted_matches = self._sort_live_by_db_age(out_of_top, flt.lots)
             logger.info(
-                "SMART BUMP '%s' → %d lot(s) (avg_interval=%.0fs, detection=%s)",
-                flt.name, min(n, len(sorted_matches)), self._avg_refresh_interval,
+                "SMART BUMP '%s' → %d/%d out-of-top lot(s) (top-%d, avg=%.0fs, detection=%s)",
+                flt.name, min(n, len(sorted_matches)), len(out_of_top), threshold,
+                self._avg_refresh_interval,
                 "ON/expires_at" if self._last_board_refresh_ts else "OFF/fixed",
             )
             for live in sorted_matches[:n]:
