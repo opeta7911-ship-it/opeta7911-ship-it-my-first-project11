@@ -124,7 +124,8 @@ class PlayerokClient:
 
     def _fetch_sold_lots_sync(self, account: Account) -> list:
         from playerokapi.enums import ItemStatuses as _S
-        page = account.get_my_items(statuses=[_S.SOLD], count=24)
+        user = account.get_user(id=account.id)
+        page = user.get_items(count=24, statuses=[_S.SOLD])
         return page.items
 
     async def get_sold_lots(self) -> list[MyLot]:
