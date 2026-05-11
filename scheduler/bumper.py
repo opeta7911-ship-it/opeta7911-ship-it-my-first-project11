@@ -363,22 +363,25 @@ class BumpEngine:
 
                     sleep_for = bump_target_ts - datetime.utcnow().timestamp()
             else:
-                # No calibration data yet — wait for the first detected board refresh
-                # before bumping anything. Bumping at a random time is useless.
-                logger.info("SMART BUMP: no calibration data — observing board refresh before first bump...")
-                while self._enabled:
-                    self._any_refresh.clear()
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(self._any_refresh.wait()),
-                            timeout=5.0,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
+                # No calibration data yet. expires_at only changes when WE bump, so
+                # waiting for a detection without bumping is a deadlock. Do one
+                # calibration bump now, then wait for the detection loop to record
+                # the resulting expires_at change and set last_ts.
+                logger.info("SMART BUMP: no calibration data — doing calibration bump to bootstrap timing")
+                try:
+                    await self._do_smart_bumps()
+                    self._smart_bumped_at = datetime.utcnow().timestamp()
+                except Exception:
+                    logger.exception("Smart bump (calibration) failed")
+                # Wait up to 30s for the poll loop to detect the expires_at change
+                waited = 0.0
+                while waited < 30.0 and self._enabled:
+                    await asyncio.sleep(2.0)
+                    waited += 2.0
                     if any(t.last_ts is not None for t in self._board_trackers.values()):
-                        logger.info("SMART BUMP: calibrated — switching to smart timing")
+                        logger.info("SMART BUMP: calibrated after %.0fs — switching to smart timing", waited)
                         break
-                # Restart loop: now bump_target_ts will be computed from real data
+                # Restart loop: next iteration computes target from real last_ts
                 continue
 
             if not self._enabled:
