@@ -101,6 +101,8 @@ class AutoRestoreEngine:
                 )
                 await self._notify_restored(lot, cost_kopecks)
             except Exception as exc:
+                # Remove from known set so the next cycle retries the restore.
+                self._known_sold_ids.discard(lot.playerok_id)
                 logger.exception("AutoRestore: не удалось восстановить '%s'", lot.name)
                 await self._notify_restore_failed(lot, str(exc))
 
