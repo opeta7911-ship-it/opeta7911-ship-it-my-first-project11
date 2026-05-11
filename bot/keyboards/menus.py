@@ -33,14 +33,11 @@ def filters_menu(filters: list[Filter]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for f in filters:
         flag = "🟢" if f.enabled else "🔴"
-        interval = f"{f.interval_minutes}мин" if f.interval_minutes else "не задан"
+        interval = f"{f.interval_minutes}м" if f.interval_minutes else "—"
+        label = f.name[:14]
         kb.button(
-            text=f"{f.name} · {interval}",
+            text=f"{flag} {label} · {interval}",
             callback_data=f"filter:{f.id}",
-        )
-        kb.button(
-            text=flag,
-            callback_data=f"filter_quick_toggle:{f.id}",
         )
     any_enabled = any(f.enabled for f in filters)
     if any_enabled:
@@ -49,7 +46,11 @@ def filters_menu(filters: list[Filter]) -> InlineKeyboardMarkup:
         kb.button(text="✅ Включить все", callback_data="filters_toggle_all:1")
     kb.button(text="➕ Создать фильтр", callback_data="filter_create")
     kb.button(text="◀️ Назад", callback_data="back_main")
-    kb.adjust(*([2] * len(filters)), 1, 1, 1)
+    # 2 filters per row, then action buttons 1 per row
+    rows = [2] * (len(filters) // 2)
+    if len(filters) % 2:
+        rows.append(1)
+    kb.adjust(*rows, 1, 1, 1)
     return kb.as_markup()
 
 
