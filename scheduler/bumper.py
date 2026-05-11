@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 BumpCallback = Callable[[Lot, bool, int, str | None], Awaitable[None]]
 
 
+class _BoardTracker:
+    """Per-category board refresh timing tracker (one per top_position filter keyword)."""
+    __slots__ = ("last_ts", "avg_interval", "refresh_detected")
+
+    def __init__(self) -> None:
+        self.last_ts: float | None = None
+        self.avg_interval: float = 62.0
+        self.refresh_detected: asyncio.Event = asyncio.Event()
+
 
 class BumpEngine:
     """Движок поднятий: тикает раз в минуту, выбирает следующий лот и поднимает."""
@@ -34,17 +43,12 @@ class BumpEngine:
         self._enabled = False
         self._live_lots: list[MyLot] = []
         self._startup_done: asyncio.Event = asyncio.Event()
-        # Board refresh timing (for smart top-position bumping)
-        self._last_board_refresh_ts: float | None = None
-        self._avg_refresh_interval: float = 62.0
+        # Per-category board refresh trackers (keyword → tracker).
+        # Each top_position filter keyword gets its own tracker so different
+        # game boards (Brawl Stars, Roblox, …) calibrate independently.
+        self._board_trackers: dict[str, _BoardTracker] = {}
+        self._any_refresh: asyncio.Event = asyncio.Event()
         self._prev_expires: dict[str, datetime | None] = {}
-        # Fired immediately when a board refresh is detected — smart_bump_loop
-        # reacts within ms instead of waiting up to 2s in the sleep chunk.
-        self._refresh_detected: asyncio.Event = asyncio.Event()
-        # Keywords from enabled top_position filters — only expires_at changes
-        # on these lots are used for board-refresh timing. Lots in other categories
-        # (Robux, etc.) have independent refresh cycles and must not corrupt timing.
-        self._top_position_keywords: list[str] = []
         self._top_kw_poll_counter: int = 0
         # Used to compute "time since engine start" for never-bumped filters
         # so they wait a full interval before their first bump (not immediately).
@@ -59,11 +63,9 @@ class BumpEngine:
             return
         self._enabled = True
         self._startup_done.clear()
-        self._last_board_refresh_ts = None
-        self._avg_refresh_interval = 62.0
+        self._board_trackers.clear()
+        self._any_refresh.clear()
         self._prev_expires.clear()
-        self._refresh_detected.clear()
-        self._top_position_keywords = []
         self._top_kw_poll_counter = 0
         self._engine_start_ts = datetime.utcnow()
         asyncio.create_task(self._startup_sync())
@@ -72,7 +74,8 @@ class BumpEngine:
         self._task = asyncio.create_task(self._run_loop())
 
     async def _refresh_top_kw_cache(self) -> None:
-        """Reload the keyword list for top_position filters from DB."""
+        """Sync _board_trackers with enabled top_position filters in DB.
+        New keywords get a fresh tracker; removed keywords lose theirs."""
         try:
             async with self.db.session_factory() as session:
                 rows = await session.execute(
@@ -82,8 +85,14 @@ class BumpEngine:
                         Filter.keyword.isnot(None),
                     )
                 )
-                self._top_position_keywords = [r[0].lower() for r in rows if r[0]]
-                logger.debug("top_position keywords: %s", self._top_position_keywords)
+                current_kws = {r[0].lower() for r in rows if r[0]}
+            for kw in current_kws - self._board_trackers.keys():
+                self._board_trackers[kw] = _BoardTracker()
+                logger.info("BoardTracker: added category '%s'", kw)
+            for kw in list(self._board_trackers.keys() - current_kws):
+                del self._board_trackers[kw]
+                logger.info("BoardTracker: removed category '%s'", kw)
+            logger.debug("top_position trackers: %s", list(self._board_trackers.keys()))
         except Exception as e:
             logger.warning("Failed to refresh top_position keyword cache: %s", e)
 
@@ -112,9 +121,7 @@ class BumpEngine:
                 # Detect board approval: when expires_at changes for any lot, Playerok
                 # updated its approval_date (= our bump was processed by the board cycle).
                 # approval_ts = expires_at - LOT_LIFETIME_DAYS  ≈  board refresh time.
-                # IMPORTANT: only track lots that match a top_position filter keyword.
-                # Lots in other categories (Robux, etc.) refresh on an independent cycle
-                # and must not corrupt our BRAWL PASS PLUS smart-bump timing.
+                # Route each approval to the matching per-category tracker.
                 for pid, new_exp in new_expires.items():
                     old_exp = self._prev_expires.get(pid)
                     if old_exp is None or new_exp is None or new_exp == old_exp:
@@ -124,70 +131,69 @@ class BumpEngine:
                     if now_ts - approval_ts > 180:
                         continue
 
-                    # Skip lots not belonging to a top_position filter category.
-                    # If cache is empty (no top_position filters enabled) — skip ALL lots:
-                    # better to use fixed 62s fallback than pollute timing with other boards.
                     lot_name = pid_to_name.get(pid, "")
-                    if not self._top_position_keywords or not any(
-                        kw in lot_name.lower() for kw in self._top_position_keywords
-                    ):
-                        logger.debug(
-                            "Board approval ignored for smart timing: '%s'",
-                            lot_name,
-                        )
+                    lot_name_lower = lot_name.lower()
+
+                    if not self._board_trackers:
+                        logger.debug("Board approval ignored (no trackers active): '%s'", lot_name)
                         continue
 
-                    logger.info(
-                        "Board approval via expires_at: lot=%s ('%s') approved=%.0fs ago",
-                        pid, lot_name, now_ts - approval_ts,
+                    matched_kw = next(
+                        (kw for kw in self._board_trackers if kw in lot_name_lower), None
                     )
-                    if self._last_board_refresh_ts is not None:
-                        interval = approval_ts - self._last_board_refresh_ts
+                    if matched_kw is None:
+                        logger.debug("Board approval ignored (no matching tracker): '%s'", lot_name)
+                        continue
+
+                    tracker = self._board_trackers[matched_kw]
+                    logger.info(
+                        "Board approval [%s]: lot='%s' approved=%.0fs ago",
+                        matched_kw, lot_name, now_ts - approval_ts,
+                    )
+                    if tracker.last_ts is not None:
+                        interval = approval_ts - tracker.last_ts
                         if 15 < interval < 300:
-                            # Detect missed detections (e.g. after rate-limit gap):
-                            # if the gap is much longer than expected, treat it as
-                            # multiple cycles and feed the per-cycle value to EMA.
-                            n_cycles = max(1, round(interval / self._avg_refresh_interval))
+                            n_cycles = max(1, round(interval / tracker.avg_interval))
                             effective = interval / n_cycles
-                            # EMA (α=0.4): adapts within 3-4 samples
-                            self._avg_refresh_interval = (
-                                0.4 * effective + 0.6 * self._avg_refresh_interval
-                            )
+                            tracker.avg_interval = 0.4 * effective + 0.6 * tracker.avg_interval
                             if n_cycles > 1:
                                 logger.info(
-                                    "Board refresh interval: %.0fs (%d cycles → %.1fs each) avg=%.0fs",
-                                    interval, n_cycles, effective, self._avg_refresh_interval,
+                                    "Board [%s] refresh: %.0fs (%d cycles → %.1fs each) avg=%.0fs",
+                                    matched_kw, interval, n_cycles, effective, tracker.avg_interval,
                                 )
                             else:
                                 logger.info(
-                                    "Board refresh interval: %.0fs  avg=%.0fs",
-                                    interval, self._avg_refresh_interval,
+                                    "Board [%s] refresh: %.0fs  avg=%.0fs",
+                                    matched_kw, interval, tracker.avg_interval,
                                 )
-                    if self._last_board_refresh_ts is None or approval_ts > self._last_board_refresh_ts:
-                        self._last_board_refresh_ts = approval_ts
-                        self._refresh_detected.set()  # wake smart_bump_loop immediately
+                    if tracker.last_ts is None or approval_ts > tracker.last_ts:
+                        tracker.last_ts = approval_ts
+                        tracker.refresh_detected.set()
+                        self._any_refresh.set()
 
+                tracker_summary = " | ".join(
+                    f"{kw}: last={datetime.utcfromtimestamp(t.last_ts).strftime('%H:%M:%S') if t.last_ts else 'none'} avg={t.avg_interval:.0f}s"
+                    for kw, t in self._board_trackers.items()
+                )
                 logger.info(
-                    "Live lots poll: %d lots | last_approval=%s avg_interval=%.0fs",
-                    len(lots),
-                    datetime.utcfromtimestamp(self._last_board_refresh_ts).strftime("%H:%M:%S")
-                        if self._last_board_refresh_ts else "none",
-                    self._avg_refresh_interval,
+                    "Live lots poll: %d lots | [%s]",
+                    len(lots), tracker_summary or "no top_position trackers",
                 )
 
                 self._live_lots = lots
                 self._prev_expires = new_expires
-                # Adaptive poll: 4s when within 12s of predicted refresh,
+                # Adaptive poll: 4s when within 12s of any predicted refresh,
                 # 12s otherwise. 4s is fast enough to catch early refreshes
                 # while staying well under Playerok's rate limit.
                 poll_sleep = 12.0
-                if self._last_board_refresh_ts is not None:
-                    now_ts = datetime.utcnow().timestamp()
-                    elapsed = now_ts - self._last_board_refresh_ts
-                    time_in_cycle = elapsed % self._avg_refresh_interval
-                    time_to_next = self._avg_refresh_interval - time_in_cycle
-                    if time_to_next < 12:
-                        poll_sleep = 4.0
+                now_ts_check = datetime.utcnow().timestamp()
+                for t in self._board_trackers.values():
+                    if t.last_ts is not None:
+                        time_in_cycle = (now_ts_check - t.last_ts) % t.avg_interval
+                        time_to_next = t.avg_interval - time_in_cycle
+                        if time_to_next < 12:
+                            poll_sleep = 4.0
+                            break
                 await asyncio.sleep(poll_sleep)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
@@ -211,93 +217,88 @@ class BumpEngine:
             total += min(n, matches)
         return max(1, total)
 
+    def _compute_earliest_bump_target(self, margin: float) -> float | None:
+        """Return the earliest next-bump timestamp across all per-category trackers."""
+        now_ts = datetime.utcnow().timestamp()
+        earliest: float | None = None
+        for tracker in self._board_trackers.values():
+            if tracker.last_ts is None:
+                continue
+            elapsed = now_ts - tracker.last_ts
+            cycles_ahead = max(1, int(elapsed / tracker.avg_interval) + 1)
+            target = tracker.last_ts + cycles_ahead * tracker.avg_interval - margin
+            if earliest is None or target < earliest:
+                earliest = target
+        return earliest
+
     async def _smart_bump_loop(self) -> None:
-        """Bump just before the predicted board refresh.
-        Margin adapts to lots_per_trigger: N lots × 1.5s/lot so the LAST lot
-        lands ~2s before the refresh — minimising the window for competitors.
-        Self-calibrates via expires_at detection; falls back to fixed interval."""
+        """Bump just before the predicted board refresh for each category.
+        Each top_position filter keyword has its own _BoardTracker that
+        self-calibrates independently via expires_at detection.
+        Falls back to fixed interval when no detection data exists yet."""
         await self._startup_done.wait()
         await asyncio.sleep(3)
 
         while self._enabled:
-            # Margin: last lot bumped ~3s before refresh.
-            # Refresh-interval variance observed in logs reaches ±3s
-            # (59s..65s while avg=62s). 3s buffer ensures we never bump
-            # AFTER a refresh even when it comes early.
-            # Formula: (N-1) × 1.5s API overhead + 3s buffer.
+            # Margin: (N-1) × 1.5s API overhead + 3s buffer so the LAST lot
+            # lands ~3s before the refresh — minimising the window for competitors.
             n_lots = await self._estimate_smart_bump_count()
             margin = max(3.0, (n_lots - 1) * 1.5 + 3.0)
 
-            if self._last_board_refresh_ts is not None:
-                now_ts = datetime.utcnow().timestamp()
-                interval = self._avg_refresh_interval
-                elapsed = now_ts - self._last_board_refresh_ts
-                cycles_ahead = max(1, int(elapsed / interval) + 1)
-                bump_target_ts = self._last_board_refresh_ts + cycles_ahead * interval - margin
-                baseline_refresh_ts = self._last_board_refresh_ts
+            bump_target_ts = self._compute_earliest_bump_target(margin)
 
+            if bump_target_ts is not None:
+                now_ts = datetime.utcnow().timestamp()
                 sleep_for = bump_target_ts - now_ts
+
                 logger.info(
-                    "SMART BUMP: next refresh in %.1fs (last=%.0fs ago, avg=%.0fs, lots=%d, margin=%.1fs)",
-                    sleep_for + margin, elapsed, interval, n_lots, margin,
+                    "SMART BUMP: target in %.1fs (trackers=%d, lots=%d, margin=%.1fs)",
+                    sleep_for + margin, len(self._board_trackers), n_lots, margin,
                 )
 
                 while sleep_for > 0.5 and self._enabled:
-                    # Wait at most 2s OR wake immediately when refresh detected.
-                    self._refresh_detected.clear()
+                    # Sleep at most 2s, or wake immediately when any board refreshes.
+                    self._any_refresh.clear()
                     try:
                         await asyncio.wait_for(
-                            asyncio.shield(self._refresh_detected.wait()),
+                            asyncio.shield(self._any_refresh.wait()),
                             timeout=min(sleep_for, 2.0),
                         )
                     except asyncio.TimeoutError:
                         pass
-                    now_ts = datetime.utcnow().timestamp()
 
-                    if self._last_board_refresh_ts is not None:
-                        new_iv = self._avg_refresh_interval
-                        new_elapsed = now_ts - self._last_board_refresh_ts
-                        new_cycles = max(1, int(new_elapsed / new_iv) + 1)
-                        new_target = self._last_board_refresh_ts + new_cycles * new_iv - margin
+                    new_target = self._compute_earliest_bump_target(margin)
+                    if new_target is not None and new_target < bump_target_ts:
+                        bump_target_ts = new_target
+                        now_ts = datetime.utcnow().timestamp()
+                        logger.info(
+                            "SMART BUMP: refresh detected, retargeted to +%.1fs",
+                            bump_target_ts - now_ts,
+                        )
 
-                        if new_target < bump_target_ts:
-                            # Refresh came earlier than predicted — pull target forward.
-                            bump_target_ts = new_target
-                            logger.info(
-                                "SMART BUMP: early refresh detected, retargeted to +%.1fs",
-                                new_target - now_ts,
-                            )
-                        elif (self._last_board_refresh_ts > baseline_refresh_ts
-                              and bump_target_ts > self._last_board_refresh_ts
-                              and new_target > now_ts + 1):
-                            bump_target_ts = new_target
-                            baseline_refresh_ts = self._last_board_refresh_ts
-                            logger.info(
-                                "SMART BUMP: board refreshed during sleep, retargeted to +%.1fs",
-                                new_target - now_ts,
-                            )
-
-                    sleep_for = bump_target_ts - now_ts
+                    sleep_for = bump_target_ts - datetime.utcnow().timestamp()
             else:
-                # No board refresh data yet — wait the full interval BEFORE bumping
-                # to prevent rapid-fire bumps every 15s on fresh start.
-                interval_wait = self._avg_refresh_interval
+                # No detection data yet — wait a full fallback interval before bumping
+                # so we don't rapid-fire on fresh start.
+                fallback_wait = max(
+                    (t.avg_interval for t in self._board_trackers.values()),
+                    default=62.0,
+                )
                 logger.info(
                     "SMART BUMP: no refresh detected — waiting %.0fs before bump",
-                    interval_wait,
+                    fallback_wait,
                 )
                 detection_fired = False
                 waited = 0.0
-                while waited < interval_wait and self._enabled:
+                while waited < fallback_wait and self._enabled:
                     await asyncio.sleep(2.0)
                     waited += 2.0
-                    if self._last_board_refresh_ts is not None:
-                        # Detection fired — skip this bump, next iteration uses smart timing
+                    if any(t.last_ts is not None for t in self._board_trackers.values()):
                         logger.info("SMART BUMP: detection fired during wait — switching to smart timing")
                         detection_fired = True
                         break
                 if detection_fired:
-                    continue  # restart loop with smart timing
+                    continue
 
             if not self._enabled:
                 break
@@ -307,7 +308,11 @@ class BumpEngine:
             except Exception:
                 logger.exception("Smart bump failed")
 
-            await asyncio.sleep(max(5.0, self._avg_refresh_interval * 0.25))
+            cooldown = max(
+                (t.avg_interval for t in self._board_trackers.values()),
+                default=62.0,
+            )
+            await asyncio.sleep(max(5.0, cooldown * 0.25))
 
     async def _do_smart_bumps(self) -> None:
         """Bump every top_position keyword filter at end of cycle (last in queue → first in row).
@@ -331,11 +336,14 @@ class BumpEngine:
                 continue
             n = flt.lots_per_trigger or 1
             sorted_matches = self._sort_live_by_db_age(matches, flt.lots)
+            tracker = self._board_trackers.get(kw)
+            if tracker and tracker.last_ts:
+                tracker_info = f"avg={tracker.avg_interval:.0f}s/calibrated"
+            else:
+                tracker_info = "avg=62s/fallback"
             logger.info(
-                "SMART BUMP '%s' → %d lot(s) (top-%d, avg=%.0fs, detection=%s)",
-                flt.name, min(n, len(sorted_matches)), flt.top_position,
-                self._avg_refresh_interval,
-                "ON/expires_at" if self._last_board_refresh_ts else "OFF/fixed",
+                "SMART BUMP '%s' → %d lot(s) (top-%d, %s)",
+                flt.name, min(n, len(sorted_matches)), flt.top_position, tracker_info,
             )
             for live in sorted_matches[:n]:
                 db_lot = await self._get_or_create_keyword_lot(flt.id, live)
