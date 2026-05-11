@@ -7,7 +7,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
 from database.db import Database
-from database.models import BumpHistory, Cycle, Filter, Lot
+from database.models import BumpHistory, Cycle, Filter, Lot, Setting
 from playerok.client import LOT_LIFETIME_DAYS, MyLot, PlayerokClient
 
 logger = logging.getLogger(__name__)
@@ -77,9 +77,59 @@ class BumpEngine:
         self._smart_bump_task = asyncio.create_task(self._smart_bump_loop())
         self._task = asyncio.create_task(self._run_loop())
 
+    async def _load_tracker(self, kw: str, tracker: _BoardTracker) -> None:
+        """Restore saved calibration data from DB into a fresh tracker."""
+        try:
+            async with self.db.session_factory() as session:
+                avg_row = await session.get(Setting, f"bt_avg_{kw}")
+                ts_row = await session.get(Setting, f"bt_ts_{kw}")
+            if avg_row:
+                tracker.avg_interval = float(avg_row.value)
+            if ts_row:
+                saved_ts = float(ts_row.value)
+                # Only restore last_ts if less than 5 minutes old —
+                # older data can't be used for cycle prediction.
+                age = datetime.utcnow().timestamp() - saved_ts
+                if age < 300:
+                    tracker.last_ts = saved_ts
+                    logger.info(
+                        "BoardTracker '%s': restored last_ts=%.0fs ago avg=%.0fs",
+                        kw, age, tracker.avg_interval,
+                    )
+                else:
+                    logger.info(
+                        "BoardTracker '%s': avg=%.0fs restored, last_ts stale (%.0f min ago)",
+                        kw, tracker.avg_interval, age / 60,
+                    )
+        except Exception as e:
+            logger.debug("Failed to load tracker for '%s': %s", kw, e)
+
+    def _save_tracker(self, kw: str, tracker: _BoardTracker) -> None:
+        """Persist tracker calibration to DB (fire-and-forget task)."""
+        asyncio.create_task(self._save_tracker_async(kw, tracker))
+
+    async def _save_tracker_async(self, kw: str, tracker: _BoardTracker) -> None:
+        try:
+            async with self.db.session_factory() as session:
+                for key, value in [
+                    (f"bt_avg_{kw}", str(tracker.avg_interval)),
+                    (f"bt_ts_{kw}", str(tracker.last_ts) if tracker.last_ts else None),
+                ]:
+                    if value is None:
+                        continue
+                    row = await session.get(Setting, key)
+                    if row:
+                        row.value = value
+                    else:
+                        session.add(Setting(key=key, value=value))
+                await session.commit()
+        except Exception as e:
+            logger.debug("Failed to save tracker for '%s': %s", kw, e)
+
     async def _refresh_top_kw_cache(self) -> None:
         """Sync _board_trackers with enabled top_position filters in DB.
-        New keywords get a fresh tracker; removed keywords lose theirs."""
+        New keywords get a fresh tracker loaded with saved calibration;
+        removed keywords lose theirs."""
         try:
             async with self.db.session_factory() as session:
                 rows = await session.execute(
@@ -91,7 +141,9 @@ class BumpEngine:
                 )
                 current_kws = {r[0].lower() for r in rows if r[0]}
             for kw in current_kws - self._board_trackers.keys():
-                self._board_trackers[kw] = _BoardTracker()
+                tracker = _BoardTracker()
+                await self._load_tracker(kw, tracker)
+                self._board_trackers[kw] = tracker
                 logger.info("BoardTracker: added category '%s'", kw)
             for kw in list(self._board_trackers.keys() - current_kws):
                 del self._board_trackers[kw]
@@ -180,6 +232,7 @@ class BumpEngine:
                         tracker.last_ts = approval_ts
                         tracker.refresh_detected.set()
                         self._any_refresh.set()
+                        self._save_tracker(matched_kw, tracker)
 
                 tracker_summary = " | ".join(
                     f"{kw}: last={datetime.utcfromtimestamp(t.last_ts).strftime('%H:%M:%S') if t.last_ts else 'none'} avg={t.avg_interval:.0f}s"
