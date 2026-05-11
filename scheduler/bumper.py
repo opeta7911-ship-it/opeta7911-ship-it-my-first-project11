@@ -41,6 +41,11 @@ class BumpEngine:
         # Fired immediately when a board refresh is detected — smart_bump_loop
         # reacts within ms instead of waiting up to 2s in the sleep chunk.
         self._refresh_detected: asyncio.Event = asyncio.Event()
+        # Keywords from enabled top_position filters — only expires_at changes
+        # on these lots are used for board-refresh timing. Lots in other categories
+        # (Robux, etc.) have independent refresh cycles and must not corrupt timing.
+        self._top_position_keywords: list[str] = []
+        self._top_kw_poll_counter: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -55,27 +60,57 @@ class BumpEngine:
         self._avg_refresh_interval = 62.0
         self._prev_expires.clear()
         self._refresh_detected.clear()
+        self._top_position_keywords = []
+        self._top_kw_poll_counter = 0
         asyncio.create_task(self._startup_sync())
         self._live_lots_task = asyncio.create_task(self._live_lots_loop())
         self._smart_bump_task = asyncio.create_task(self._smart_bump_loop())
         self._task = asyncio.create_task(self._run_loop())
 
+    async def _refresh_top_kw_cache(self) -> None:
+        """Reload the keyword list for top_position filters from DB."""
+        try:
+            async with self.db.session_factory() as session:
+                rows = await session.execute(
+                    select(Filter.keyword).where(
+                        Filter.enabled.is_(True),
+                        Filter.top_position.isnot(None),
+                        Filter.keyword.isnot(None),
+                    )
+                )
+                self._top_position_keywords = [r[0].lower() for r in rows if r[0]]
+                logger.debug("top_position keywords: %s", self._top_position_keywords)
+        except Exception as e:
+            logger.warning("Failed to refresh top_position keyword cache: %s", e)
+
     async def _live_lots_loop(self) -> None:
         """Polls get_my_lots() every 25s: refreshes live lots AND detects board approvals
         via expires_at changes (expires_at = approval_date + LOT_LIFETIME_DAYS)."""
         await self._startup_done.wait()
+        await self._refresh_top_kw_cache()
         if self._live_lots:
             self._prev_expires = {l.playerok_id: l.expires_at for l in self._live_lots}
             await asyncio.sleep(8)
         while self._enabled:
             try:
+                # Refresh top_position keyword cache every 10 polls (~2 min)
+                self._top_kw_poll_counter += 1
+                if self._top_kw_poll_counter % 10 == 0:
+                    await self._refresh_top_kw_cache()
+
                 lots = await self.playerok.get_my_lots()
                 new_expires = {l.playerok_id: l.expires_at for l in lots}
                 now_ts = datetime.utcnow().timestamp()
 
+                # Build a name lookup for the current poll result
+                pid_to_name = {l.playerok_id: l.name for l in lots}
+
                 # Detect board approval: when expires_at changes for any lot, Playerok
                 # updated its approval_date (= our bump was processed by the board cycle).
                 # approval_ts = expires_at - LOT_LIFETIME_DAYS  ≈  board refresh time.
+                # IMPORTANT: only track lots that match a top_position filter keyword.
+                # Lots in other categories (Robux, etc.) refresh on an independent cycle
+                # and must not corrupt our BRAWL PASS PLUS smart-bump timing.
                 for pid, new_exp in new_expires.items():
                     old_exp = self._prev_expires.get(pid)
                     if old_exp is None or new_exp is None or new_exp == old_exp:
@@ -84,9 +119,21 @@ class BumpEngine:
                     # Ignore stale approvals (older than 3 min)
                     if now_ts - approval_ts > 180:
                         continue
+
+                    # Skip lots not belonging to a top_position filter category
+                    lot_name = pid_to_name.get(pid, "")
+                    if self._top_position_keywords and not any(
+                        kw in lot_name.lower() for kw in self._top_position_keywords
+                    ):
+                        logger.debug(
+                            "Board approval ignored (non-top lot '%s'): not in top_position keywords",
+                            lot_name,
+                        )
+                        continue
+
                     logger.info(
-                        "Board approval via expires_at: lot=%s approved=%.0fs ago",
-                        pid, now_ts - approval_ts,
+                        "Board approval via expires_at: lot=%s ('%s') approved=%.0fs ago",
+                        pid, lot_name, now_ts - approval_ts,
                     )
                     if self._last_board_refresh_ts is not None:
                         interval = approval_ts - self._last_board_refresh_ts
