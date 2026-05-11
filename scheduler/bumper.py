@@ -363,24 +363,23 @@ class BumpEngine:
 
                     sleep_for = bump_target_ts - datetime.utcnow().timestamp()
             else:
-                # No detection data yet — wait a full fallback interval before bumping
-                # so we don't rapid-fire on fresh start.
-                fallback_wait = 20.0
-                logger.info(
-                    "SMART BUMP: no refresh detected — waiting %.0fs before bump",
-                    fallback_wait,
-                )
-                detection_fired = False
-                waited = 0.0
-                while waited < fallback_wait and self._enabled:
-                    await asyncio.sleep(2.0)
-                    waited += 2.0
+                # No calibration data yet — wait for the first detected board refresh
+                # before bumping anything. Bumping at a random time is useless.
+                logger.info("SMART BUMP: no calibration data — observing board refresh before first bump...")
+                while self._enabled:
+                    self._any_refresh.clear()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(self._any_refresh.wait()),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                     if any(t.last_ts is not None for t in self._board_trackers.values()):
-                        logger.info("SMART BUMP: detection fired during wait — switching to smart timing")
-                        detection_fired = True
+                        logger.info("SMART BUMP: calibrated — switching to smart timing")
                         break
-                if detection_fired:
-                    continue
+                # Restart loop: now bump_target_ts will be computed from real data
+                continue
 
             if not self._enabled:
                 break
