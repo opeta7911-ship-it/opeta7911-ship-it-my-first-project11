@@ -533,9 +533,12 @@ class BumpEngine:
                 filter_last_bump = max(all_bumped) if all_bumped else None
                 if filter_last_bump is not None:
                     elapsed = (now_utc - filter_last_bump).total_seconds() / 60
+                    # Overdue (missed interval) — don't flood-bump on startup,
+                    # treat as if first bump and wait full interval from engine start.
+                    if elapsed >= flt.interval_minutes:
+                        elapsed = (now_utc - self._engine_start_ts).total_seconds() / 60
                 else:
                     elapsed = (now_utc - self._engine_start_ts).total_seconds() / 60
-                # Use interval-1 threshold so a 1-min filter always fires each tick
                 filter_on_cooldown = elapsed < max(0, flt.interval_minutes - 1)
                 filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, matches, True))
             else:
@@ -564,7 +567,11 @@ class BumpEngine:
                 # Never-bumped lots: count from engine start so the first bump
                 # only fires after a full interval, not immediately on activation.
                 if lots[0].last_bumped_at is not None:
-                    filter_on_cooldown = _elapsed(lots[0]) < max(0, flt.interval_minutes - 1)
+                    lot_elapsed = _elapsed(lots[0])
+                    if lot_elapsed >= flt.interval_minutes:
+                        # Overdue — wait full interval from engine start, not immediately
+                        lot_elapsed = (now_utc - self._engine_start_ts).total_seconds() / 60
+                    filter_on_cooldown = lot_elapsed < max(0, flt.interval_minutes - 1)
                 else:
                     since_start = (now_utc - self._engine_start_ts).total_seconds() / 60
                     filter_on_cooldown = since_start < max(0, flt.interval_minutes - 1)
