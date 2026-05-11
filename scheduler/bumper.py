@@ -90,9 +90,11 @@ class BumpEngine:
                 # Only restore last_ts if less than 5 minutes old —
                 # older data can't be used for cycle prediction.
                 age = datetime.utcnow().timestamp() - saved_ts
-                # Use saved last_ts up to 30 min old — the EMA avg_interval is
-                # accurate enough that 30 cycles of phase drift stays within ±8s.
-                if age < 1800:
+                # Only restore last_ts if < 5 min old (< 5 board cycles).
+                # With avg_interval error of ~1s/cycle, 5 cycles = max ±5s phase error.
+                # Beyond 5 min the accumulated drift exceeds the bump margin — better
+                # to do a quick calibration bump than predict 10+ cycles ahead.
+                if age < 300:
                     tracker.last_ts = saved_ts
                     logger.info(
                         "BoardTracker '%s': restored last_ts=%.0fs ago avg=%.0fs",
@@ -100,7 +102,7 @@ class BumpEngine:
                     )
                 else:
                     logger.info(
-                        "BoardTracker '%s': avg=%.0fs restored, last_ts too stale (%.0f min ago)",
+                        "BoardTracker '%s': avg=%.0fs restored, last_ts stale (%.0f min) — will calibrate",
                         kw, tracker.avg_interval, age / 60,
                     )
         except Exception as e:
@@ -170,9 +172,9 @@ class BumpEngine:
                 if lot.expires_at is None:
                     continue
                 bootstrap_ts = (lot.expires_at - timedelta(days=LOT_LIFETIME_DAYS)).timestamp()
-                # Only use if within 30 min — beyond that, accumulated phase error
-                # exceeds the benefit of phase alignment.
-                if now_ts - bootstrap_ts > 1800:
+                # Only use if within 5 min (≤5 cycles) — beyond that, accumulated
+                # phase drift (N cycles × ~1s/cycle) exceeds the 1.5s bump margin.
+                if now_ts - bootstrap_ts > 300:
                     continue
                 lot_name_lower = lot.name.lower()
                 for kw, tracker in self._board_trackers.items():
@@ -363,10 +365,7 @@ class BumpEngine:
             else:
                 # No detection data yet — wait a full fallback interval before bumping
                 # so we don't rapid-fire on fresh start.
-                fallback_wait = max(
-                    (t.avg_interval for t in self._board_trackers.values()),
-                    default=62.0,
-                )
+                fallback_wait = 20.0
                 logger.info(
                     "SMART BUMP: no refresh detected — waiting %.0fs before bump",
                     fallback_wait,
