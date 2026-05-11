@@ -81,10 +81,7 @@ class BumpEngine:
         """Restore saved calibration data from DB into a fresh tracker."""
         try:
             async with self.db.session_factory() as session:
-                avg_row = await session.get(Setting, f"bt_avg_{kw}")
                 ts_row = await session.get(Setting, f"bt_ts_{kw}")
-            if avg_row:
-                tracker.avg_interval = float(avg_row.value)
             if ts_row:
                 saved_ts = float(ts_row.value)
                 # Only restore last_ts if less than 5 minutes old —
@@ -116,7 +113,6 @@ class BumpEngine:
         try:
             async with self.db.session_factory() as session:
                 for key, value in [
-                    (f"bt_avg_{kw}", str(tracker.avg_interval)),
                     (f"bt_ts_{kw}", str(tracker.last_ts) if tracker.last_ts else None),
                 ]:
                     if value is None:
@@ -239,20 +235,10 @@ class BumpEngine:
                     )
                     if tracker.last_ts is not None:
                         interval = approval_ts - tracker.last_ts
-                        if 15 < interval < 300:
-                            n_cycles = max(1, round(interval / tracker.avg_interval))
-                            effective = interval / n_cycles
-                            tracker.avg_interval = 0.4 * effective + 0.6 * tracker.avg_interval
-                            if n_cycles > 1:
-                                logger.info(
-                                    "Board [%s] refresh: %.0fs (%d cycles → %.1fs each) avg=%.0fs",
-                                    matched_kw, interval, n_cycles, effective, tracker.avg_interval,
-                                )
-                            else:
-                                logger.info(
-                                    "Board [%s] refresh: %.0fs  avg=%.0fs",
-                                    matched_kw, interval, tracker.avg_interval,
-                                )
+                        logger.info(
+                            "Board [%s] bump interval: %.0fs (fixed target=%.0fs)",
+                            matched_kw, interval, tracker.avg_interval,
+                        )
                     if tracker.last_ts is None or approval_ts > tracker.last_ts:
                         tracker.last_ts = approval_ts
                         tracker.refresh_detected.set()
