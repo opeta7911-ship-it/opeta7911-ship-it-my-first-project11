@@ -90,7 +90,9 @@ class BumpEngine:
                 # Only restore last_ts if less than 5 minutes old —
                 # older data can't be used for cycle prediction.
                 age = datetime.utcnow().timestamp() - saved_ts
-                if age < 300:
+                # Use saved last_ts up to 30 min old — the EMA avg_interval is
+                # accurate enough that 30 cycles of phase drift stays within ±8s.
+                if age < 1800:
                     tracker.last_ts = saved_ts
                     logger.info(
                         "BoardTracker '%s': restored last_ts=%.0fs ago avg=%.0fs",
@@ -98,7 +100,7 @@ class BumpEngine:
                     )
                 else:
                     logger.info(
-                        "BoardTracker '%s': avg=%.0fs restored, last_ts stale (%.0f min ago)",
+                        "BoardTracker '%s': avg=%.0fs restored, last_ts too stale (%.0f min ago)",
                         kw, tracker.avg_interval, age / 60,
                     )
         except Exception as e:
@@ -159,6 +161,27 @@ class BumpEngine:
         await self._refresh_top_kw_cache()
         if self._live_lots:
             self._prev_expires = {l.playerok_id: l.expires_at for l in self._live_lots}
+            # Bootstrap trackers from current approval_date of already-fetched lots.
+            # approval_date = expires_at - LOT_LIFETIME_DAYS = last board refresh time.
+            # This eliminates the blind 60s fallback wait even after a cold restart:
+            # we already KNOW when the board last processed each lot.
+            now_ts = datetime.utcnow().timestamp()
+            for lot in self._live_lots:
+                if lot.expires_at is None:
+                    continue
+                bootstrap_ts = (lot.expires_at - timedelta(days=LOT_LIFETIME_DAYS)).timestamp()
+                # Only use if within 30 min — beyond that, accumulated phase error
+                # exceeds the benefit of phase alignment.
+                if now_ts - bootstrap_ts > 1800:
+                    continue
+                lot_name_lower = lot.name.lower()
+                for kw, tracker in self._board_trackers.items():
+                    if kw in lot_name_lower and tracker.last_ts is None:
+                        tracker.last_ts = bootstrap_ts
+                        logger.info(
+                            "BoardTracker '%s': bootstrapped from approval_date, last_ts=%.0fs ago avg=%.0fs",
+                            kw, now_ts - bootstrap_ts, tracker.avg_interval,
+                        )
             await asyncio.sleep(8)
         while self._enabled:
             try:
