@@ -46,6 +46,9 @@ class BumpEngine:
         # (Robux, etc.) have independent refresh cycles and must not corrupt timing.
         self._top_position_keywords: list[str] = []
         self._top_kw_poll_counter: int = 0
+        # Used to compute "time since engine start" for never-bumped filters
+        # so they wait a full interval before their first bump (not immediately).
+        self._engine_start_ts: datetime = datetime.utcnow()
 
     @property
     def enabled(self) -> bool:
@@ -62,6 +65,7 @@ class BumpEngine:
         self._refresh_detected.clear()
         self._top_position_keywords = []
         self._top_kw_poll_counter = 0
+        self._engine_start_ts = datetime.utcnow()
         asyncio.create_task(self._startup_sync())
         self._live_lots_task = asyncio.create_task(self._live_lots_loop())
         self._smart_bump_task = asyncio.create_task(self._smart_bump_loop())
@@ -522,10 +526,15 @@ class BumpEngine:
                 if not matches:
                     logger.debug("SKIP filter '%s' (id=%d): keyword '%s' no matches", flt.name, flt.id, flt.keyword)
                     continue
-                # Determine filter cooldown from DB lots' last_bumped_at
+                # Determine filter cooldown from DB lots' last_bumped_at.
+                # If never bumped: count from engine start so the filter waits
+                # a full interval before first bump (no immediate bump on start).
                 all_bumped = [l.last_bumped_at for l in flt.lots if l.last_bumped_at]
                 filter_last_bump = max(all_bumped) if all_bumped else None
-                elapsed = (now_utc - filter_last_bump).total_seconds() / 60 if filter_last_bump else float("inf")
+                if filter_last_bump is not None:
+                    elapsed = (now_utc - filter_last_bump).total_seconds() / 60
+                else:
+                    elapsed = (now_utc - self._engine_start_ts).total_seconds() / 60
                 # Use interval-1 threshold so a 1-min filter always fires each tick
                 filter_on_cooldown = elapsed < max(0, flt.interval_minutes - 1)
                 filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, matches, True))
@@ -552,7 +561,13 @@ class BumpEngine:
                 lots.sort(key=_lot_key)
                 all_bumped = [l.last_bumped_at for l in lots if l.last_bumped_at is not None]
                 filter_last_bump = max(all_bumped) if all_bumped else None
-                filter_on_cooldown = _elapsed(lots[0]) < max(0, flt.interval_minutes - 1)
+                # Never-bumped lots: count from engine start so the first bump
+                # only fires after a full interval, not immediately on activation.
+                if lots[0].last_bumped_at is not None:
+                    filter_on_cooldown = _elapsed(lots[0]) < max(0, flt.interval_minutes - 1)
+                else:
+                    since_start = (now_utc - self._engine_start_ts).total_seconds() / 60
+                    filter_on_cooldown = since_start < max(0, flt.interval_minutes - 1)
                 filter_candidates.append((filter_on_cooldown, filter_last_bump, flt, lots, False))
 
         if not filter_candidates:

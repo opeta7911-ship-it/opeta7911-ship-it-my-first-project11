@@ -4,6 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 
 from bot.handlers import register_all
 from config import load_config
@@ -63,6 +64,8 @@ async def main() -> None:
     dp["config"] = config
 
     register_all(dp)
+
+    await bot.set_my_commands([BotCommand(command="start", description="🚀 Старт")])
 
     logger.info("Bot starting...")
     await restore_engine.start()
