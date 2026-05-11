@@ -162,11 +162,11 @@ class BumpEngine:
             await asyncio.sleep(8)
         while self._enabled:
             try:
-                # If a smart bump just fired, wait 10s before polling to avoid
-                # triggering Playerok's rate limit (bump + immediate poll).
+                # If a smart bump just fired, wait 20s before polling to avoid
+                # triggering Playerok's rate limit (bump + tick + poll = too many).
                 since_bump = datetime.utcnow().timestamp() - self._smart_bumped_at
-                if since_bump < 10.0:
-                    await asyncio.sleep(10.0 - since_bump)
+                if since_bump < 20.0:
+                    await asyncio.sleep(20.0 - since_bump)
 
                 # Refresh top_position keyword cache every 10 polls (~2 min)
                 self._top_kw_poll_counter += 1
@@ -245,19 +245,11 @@ class BumpEngine:
 
                 self._live_lots = lots
                 self._prev_expires = new_expires
-                # Adaptive poll: 8s when within 15s of any predicted refresh,
-                # 12s otherwise. 4s caused Playerok rate limits right after
-                # smart bumps (bump + immediate poll = too many requests).
-                poll_sleep = 12.0
-                now_ts_check = datetime.utcnow().timestamp()
-                for t in self._board_trackers.values():
-                    if t.last_ts is not None:
-                        time_in_cycle = (now_ts_check - t.last_ts) % t.avg_interval
-                        time_to_next = t.avg_interval - time_in_cycle
-                        if time_to_next < 15:
-                            poll_sleep = 8.0
-                            break
-                await asyncio.sleep(poll_sleep)
+                # Flat 16s poll interval. Adaptive shorter intervals (4-8s) caused
+                # rate limits when combined with simultaneous bump + minute tick.
+                # 16s is fast enough for EMA calibration (detection within ~16s
+                # of actual refresh) while keeping total API calls below Playerok limits.
+                await asyncio.sleep(16.0)
             except Exception as e:
                 logger.warning("Live lots refresh failed: %s — retry in 60s", e)
                 await asyncio.sleep(60)
@@ -306,10 +298,12 @@ class BumpEngine:
             # Sync trackers in case filters were enabled/disabled since last poll refresh.
             await self._refresh_top_kw_cache()
 
-            # Margin: (N-1) × 1.5s API overhead + 3s buffer so the LAST lot
-            # lands ~3s before the refresh — minimising the window for competitors.
+            # Margin: (N-1) × 1.5s API overhead + 1.5s buffer so the LAST lot
+            # lands ~1.5s before the refresh. Smaller margin = fewer competitors
+            # can squeeze in after us. Risk: if refresh comes >1.5s early we miss
+            # one cycle, but the EMA keeps variance well within ±2s after calibration.
             n_lots = await self._estimate_smart_bump_count()
-            margin = max(3.0, (n_lots - 1) * 1.5 + 3.0)
+            margin = max(1.5, (n_lots - 1) * 1.5 + 1.5)
 
             bump_target_ts = self._compute_earliest_bump_target(margin)
 
