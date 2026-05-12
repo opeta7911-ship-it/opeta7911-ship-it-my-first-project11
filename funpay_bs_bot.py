@@ -264,63 +264,63 @@ async def funpay_monitor(bot: Bot):
         from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
 
         runner = Runner(_account)
+        logger.info("FunPay Runner запущен, слушаю события...")
 
-        async def on_new_order(e: NewOrderEvent):
-            order = e.order
-            if not order.subcategory:
-                return
-            if order.subcategory.id not in BRAWL_CATS:
-                return
-            chat_id  = order.chat_id
-            username = order.buyer_username
-            WAITING_EMAIL.add(chat_id)
-            await fp_send(chat_id, MSG_ASK_EMAIL, username)
-            logger.info("Заказ BS от %s — ждём почту", username)
+        async for event in runner.listen():
+            try:
+                if isinstance(event, NewOrderEvent):
+                    order = event.order
+                    if not order.subcategory:
+                        continue
+                    if order.subcategory.id not in BRAWL_CATS:
+                        continue
+                    chat_id  = order.chat_id
+                    username = order.buyer_username
+                    WAITING_EMAIL.add(chat_id)
+                    await fp_send(chat_id, MSG_ASK_EMAIL, username)
+                    logger.info("Заказ BS от %s — ждём почту", username)
 
-        async def on_new_message(e: NewMessageEvent):
-            msg      = e.message
-            chat_id  = msg.chat_id
-            username = msg.author
-            text     = (msg.text or "").strip()
+                elif isinstance(event, NewMessageEvent):
+                    msg      = event.message
+                    chat_id  = msg.chat_id
+                    username = msg.author
+                    text     = (msg.text or "").strip()
 
-            if username == _account.username:
-                return
+                    if username == _account.username:
+                        continue
 
-            # Ждём код
-            if chat_id in WAITING_CODE:
-                code = text.replace(" ", "")
-                if re.fullmatch(r"\d{6}", code):
-                    state = WAITING_CODE.pop(chat_id)
-                    await notify_group(bot, chat_id, username, state["email"], code)
-                    logger.info("Код от %s отправлен в группу", username)
-                return
+                    if chat_id in WAITING_CODE:
+                        code = text.replace(" ", "")
+                        if re.fullmatch(r"\d{6}", code):
+                            state = WAITING_CODE.pop(chat_id)
+                            await notify_group(bot, chat_id, username, state["email"], code)
+                            logger.info("Код от %s отправлен в группу", username)
+                        continue
 
-            # Ждём почту
-            if chat_id in WAITING_EMAIL:
-                email = extract_email(text)
-                if email:
-                    WAITING_EMAIL.discard(chat_id)
-                    logger.info("Получена почта %s от %s — запрашиваю код", email, username)
-                    resp, did, ua_info = await asyncio.to_thread(request_otp, email)
-                    if resp and resp.status_code == 200:
-                        WAITING_CODE[chat_id] = {
-                            "email": email, "did": did,
-                            "ua_info": ua_info, "username": username,
-                        }
-                        await fp_send(chat_id, MSG_CODE_SENT, username)
-                    else:
-                        await fp_send(chat_id,
-                                      "❌ Не удалось запросить код, попробуй позже",
-                                      username)
-                return
+                    if chat_id in WAITING_EMAIL:
+                        email = extract_email(text)
+                        if email:
+                            WAITING_EMAIL.discard(chat_id)
+                            logger.info("Получена почта %s от %s — запрашиваю код", email, username)
+                            resp, did, ua_info = await asyncio.to_thread(request_otp, email)
+                            if resp and resp.status_code == 200:
+                                WAITING_CODE[chat_id] = {
+                                    "email": email, "did": did,
+                                    "ua_info": ua_info, "username": username,
+                                }
+                                await fp_send(chat_id, MSG_CODE_SENT, username)
+                            else:
+                                await fp_send(chat_id,
+                                              "❌ Не удалось запросить код, попробуй позже",
+                                              username)
+                        continue
 
-            # Первое сообщение — приветствие
-            if chat_id not in GREETED:
-                GREETED.add(chat_id)
-                await fp_send(chat_id, MSG_GREETING, username)
+                    if chat_id not in GREETED:
+                        GREETED.add(chat_id)
+                        await fp_send(chat_id, MSG_GREETING, username)
 
-        logger.info("Runner methods: %s", [m for m in dir(runner) if not m.startswith('_')])
-        await runner.run()
+            except Exception as inner_e:
+                logger.error("Ошибка обработки события: %s", inner_e, exc_info=True)
 
     except Exception as e:
         logger.error("FunPay runner error: %s", e, exc_info=True)
