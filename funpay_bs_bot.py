@@ -319,8 +319,7 @@ async def funpay_monitor(bot: Bot):
                 GREETED.add(chat_id)
                 await fp_send(chat_id, MSG_GREETING, username)
 
-        runner.add_handler(NewOrderEvent, on_new_order)
-        runner.add_handler(NewMessageEvent, on_new_message)
+        logger.info("Runner methods: %s", [m for m in dir(runner) if not m.startswith('_')])
         await runner.run()
 
     except Exception as e:
