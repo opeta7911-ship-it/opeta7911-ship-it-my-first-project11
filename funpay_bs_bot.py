@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════════
 BOT_TOKEN  = "8733509952:AAFKqAu9ARRz-hxgEU6VgnQOO5erPpY8T9s"
-GOLDEN_KEY = "tzjjscw4knm25btp908cu05g068t8rzv"
+GOLDEN_KEY = "dlc9wlzfce6bl06jcg5660vcwctgk8ug"
 ADMIN_ID   = 1330689833
 GROUP_ID   = -1003823157522
 # ══════════════════════════════════════════════════════════════════════
