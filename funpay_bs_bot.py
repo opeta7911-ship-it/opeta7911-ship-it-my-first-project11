@@ -20,7 +20,8 @@ import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import CallbackQuery, InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM, Message
 
 try:
     from fake_useragent import UserAgent
@@ -220,6 +221,19 @@ async def notify_group(bot: Bot, chat_id: int, username: str,
         f"🔑 Код покупателя: <code>{code}</code>"
     )
     await bot.send_message(GROUP_ID, text, reply_markup=kb)
+
+
+@router.message(Command("start"))
+async def cmd_start(msg: Message):
+    if msg.from_user.id not in (ADMIN_ID,):
+        return
+    fp_status = "✅ подключён" if _account else "⏳ подключаюсь..."
+    await msg.answer(
+        f"🤖 <b>FunPay BS Bot</b>\n\n"
+        f"FunPay: {fp_status}\n"
+        f"Ожидают почту: {len(WAITING_EMAIL)} чат(ов)\n"
+        f"Ожидают код: {len(WAITING_CODE)} чат(ов)"
+    )
 
 
 @router.callback_query(F.data.startswith("done:"))
