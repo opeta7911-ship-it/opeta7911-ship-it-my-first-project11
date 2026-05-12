@@ -349,6 +349,10 @@ class BumpEngine:
 
                     sleep_for = bump_target_ts - datetime.utcnow().timestamp()
             else:
+                if not self._board_trackers:
+                    # No top_position filters enabled — nothing to calibrate, just idle
+                    await asyncio.sleep(10.0)
+                    continue
                 # No calibration data yet. expires_at only changes when WE bump, so
                 # waiting for a detection without bumping is a deadlock. Do one
                 # calibration bump now, then wait for the detection loop to record
