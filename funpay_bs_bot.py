@@ -276,9 +276,9 @@ async def funpay_monitor(bot: Bot):
 
     try:
         from FunPayAPI.updater.runner import Runner
-        from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
+        from FunPayAPI.updater.events import LastChatMessageChangedEvent, NewOrderEvent
 
-        runner = Runner(_account)
+        runner = Runner(_account, disable_message_requests=True)
         loop = asyncio.get_running_loop()
         logger.info("FunPay Runner запущен, слушаю события...")
 
@@ -296,14 +296,16 @@ async def funpay_monitor(bot: Bot):
                     await fp_send(chat_id, MSG_ASK_EMAIL, username)
                     logger.info("Заказ BS от %s — ждём почту", username)
 
-                elif isinstance(event, NewMessageEvent):
-                    msg      = event.message
-                    chat_id  = msg.chat_id
-                    username = msg.author
-                    text     = (msg.text or "").strip()
+                elif isinstance(event, LastChatMessageChangedEvent):
+                    chat     = event.chat
+                    chat_id  = chat.id
+                    username = chat.with_username
+                    text     = (chat.last_message_text or "").strip()
 
-                    if username == _account.username:
+                    if chat.last_message_author_username == _account.username:
                         return
+
+                    logger.info("Сообщение от %s (chat %s): %s", username, chat_id, text[:60])
 
                     if chat_id in WAITING_CODE:
                         code = text.replace(" ", "")
