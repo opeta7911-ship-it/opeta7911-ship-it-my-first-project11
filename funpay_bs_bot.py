@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# v5
 """Standalone FunPay Brawl Stars OTP Bot"""
 from __future__ import annotations
 
