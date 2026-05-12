@@ -264,16 +264,17 @@ async def funpay_monitor(bot: Bot):
         from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
 
         runner = Runner(_account)
+        loop = asyncio.get_running_loop()
         logger.info("FunPay Runner запущен, слушаю события...")
 
-        async for event in runner.listen():
+        async def handle_event(event):
             try:
                 if isinstance(event, NewOrderEvent):
                     order = event.order
                     if not order.subcategory:
-                        continue
+                        return
                     if order.subcategory.id not in BRAWL_CATS:
-                        continue
+                        return
                     chat_id  = order.chat_id
                     username = order.buyer_username
                     WAITING_EMAIL.add(chat_id)
@@ -287,7 +288,7 @@ async def funpay_monitor(bot: Bot):
                     text     = (msg.text or "").strip()
 
                     if username == _account.username:
-                        continue
+                        return
 
                     if chat_id in WAITING_CODE:
                         code = text.replace(" ", "")
@@ -295,7 +296,7 @@ async def funpay_monitor(bot: Bot):
                             state = WAITING_CODE.pop(chat_id)
                             await notify_group(bot, chat_id, username, state["email"], code)
                             logger.info("Код от %s отправлен в группу", username)
-                        continue
+                        return
 
                     if chat_id in WAITING_EMAIL:
                         email = extract_email(text)
@@ -313,7 +314,7 @@ async def funpay_monitor(bot: Bot):
                                 await fp_send(chat_id,
                                               "❌ Не удалось запросить код, попробуй позже",
                                               username)
-                        continue
+                        return
 
                     if chat_id not in GREETED:
                         GREETED.add(chat_id)
@@ -321,6 +322,13 @@ async def funpay_monitor(bot: Bot):
 
             except Exception as inner_e:
                 logger.error("Ошибка обработки события: %s", inner_e, exc_info=True)
+
+        def sync_loop():
+            for event in runner.listen():
+                future = asyncio.run_coroutine_threadsafe(handle_event(event), loop)
+                future.result()
+
+        await asyncio.to_thread(sync_loop)
 
     except Exception as e:
         logger.error("FunPay runner error: %s", e, exc_info=True)
