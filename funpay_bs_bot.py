@@ -262,11 +262,9 @@ async def funpay_monitor(bot: Bot):
     try:
         from FunPayAPI.updater.runner import Runner
         from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
-        from FunPayAPI.common.enums import OrderStatuses
 
         runner = Runner(_account)
 
-        @runner.event
         async def on_new_order(e: NewOrderEvent):
             order = e.order
             if not order.subcategory:
@@ -279,7 +277,6 @@ async def funpay_monitor(bot: Bot):
             await fp_send(chat_id, MSG_ASK_EMAIL, username)
             logger.info("Заказ BS от %s — ждём почту", username)
 
-        @runner.event
         async def on_new_message(e: NewMessageEvent):
             msg      = e.message
             chat_id  = msg.chat_id
@@ -322,6 +319,8 @@ async def funpay_monitor(bot: Bot):
                 GREETED.add(chat_id)
                 await fp_send(chat_id, MSG_GREETING, username)
 
+        runner.add_handler(NewOrderEvent, on_new_order)
+        runner.add_handler(NewMessageEvent, on_new_message)
         await runner.run()
 
     except Exception as e:
