@@ -33,3 +33,8 @@ class FilterEditKeyword(StatesGroup):
 
 class RestoreAddExclude(StatesGroup):
     waiting_for_keyword = State()
+
+
+class AddUser(StatesGroup):
+    waiting_for_telegram_id = State()
+    waiting_for_cookies = State()
