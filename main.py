@@ -5,7 +5,7 @@ import os
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 
 from bot.handlers import register_all
 from bot.middleware import UserContextMiddleware
@@ -65,13 +65,20 @@ async def main() -> None:
 
     register_all(dp)
 
+    # All users see only /start
+    await bot.set_my_commands(
+        [BotCommand(command="start", description="🚀 Старт")],
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+    # Admin also sees management commands
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="🚀 Старт"),
-            BotCommand(command="adduser", description="➕ Добавить юзера (admin)"),
-            BotCommand(command="removeuser", description="➖ Удалить юзера (admin)"),
-            BotCommand(command="listusers", description="📋 Список юзеров (admin)"),
-        ]
+            BotCommand(command="adduser", description="➕ Добавить юзера"),
+            BotCommand(command="removeuser", description="➖ Удалить юзера"),
+            BotCommand(command="listusers", description="📋 Список юзеров"),
+        ],
+        scope=BotCommandScopeChat(chat_id=config.admin_id),
     )
 
     logger.info("Bot starting...")
